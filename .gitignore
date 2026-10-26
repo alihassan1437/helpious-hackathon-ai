@@ -1,0 +1,8 @@
+# Never commit credentials to the public hackathon repo.
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+credentials*
+*secret*
