@@ -18,10 +18,13 @@
 //   - Output is an "AI suggestion" pre-filled into an editable form,
 //     never auto-sent.
 //
-// Voice: D1 voice features take a TRANSCRIPT (text) as input. No audio
-// bytes are sent anywhere in D1, and no voice model is called. The
-// transcription step (muse-voice-transcribe-1.0 in prod) plugs in
-// before this gateway, feeding the same transcript shape.
+// Voice: the v1 voice prompts take a TRANSCRIPT (text) as input.
+// When a voice call carries a recording, transcription
+// (muse-voice-transcribe-1.0) happens inside the real provider
+// (provider.ts callTranscribe): the provider transcribes, PII-strips
+// the transcript, and feeds it to these prompts in exactly this
+// transcript shape. The transcription endpoint was verified live
+// on 2026-10-30 — see docs/ai-gateway.md (Voice section).
 
 import type { AiFeature } from './gateway';
 

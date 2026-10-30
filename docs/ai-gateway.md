@@ -43,11 +43,20 @@ ships to the browser.
   1024x1024. The API returns JSON with `data[0].b64_json` whose
   bytes are WEBP, not JPEG — the mime is sniffed from the bytes and
   returned explicitly (`imageMime` + `imageDataUri`), never assumed.
+- Transcription: `POST /v1/asr/transcribe`, model
+  `muse-voice-transcribe-1.0`, multipart/form-data with a JSON
+  `request` part ({ mode: 'PUSH_TO_TALK', model, audioEncoding:
+  'WAV' }) + an `audio` part holding a WAV file, JSON
+  `{ transcript }` back. **VERIFIED LIVE 2026-10-30** (contract
+  from Meta's official cookbook + a real call; see the Voice
+  section). The client converts recordings to mono 16 kHz WAV
+  before upload — the endpoint takes WAV, browsers record
+  webm/m4a. Isolated in `callTranscribe()` in provider.ts.
 - Models (Standard tier only, enforced in both gateway and
   provider): `muse-spark-1.3` (default), `muse-spark-1.2`,
   `muse-spark-1.1`, `sam-3.1`, `muse-image-1.0`,
-  `muse-voice-transcribe-1.0` (allow-listed; transcription transport
-  not yet built — voice features take transcripts today). Any
+  `muse-voice-transcribe-1.0` (transcription verified live
+  2026-10-30 — see above). Any
   `*-contributor` ID is rejected before any network call.
 - Measured smoke-test costs (2026-10-28, Standard rates, test data
   only): vision brief ~$0.008, SAM $0.0025/image. Credit balance
@@ -79,8 +88,11 @@ Content-Type: application/json
   (`400 Unknown AI feature`).
 - `input` — the feature's payload (text and/or image references). Images
   must already be resized/compressed by the browser (max 1024px, ~150 KB).
-  Voice features take a `transcript` string in D1 — no audio bytes are
-  sent to this endpoint.
+  Voice features accept a `transcript` string (text-only) OR a
+  recording as `audioDataUri` (`data:audio/...;base64,...`, max
+  4 MB of audio); with audio, the provider transcribes first and
+  the stripped transcript rides on the output. See the Voice
+  section.
 - `promptVersion` — optional; defaults to the feature's current version.
   It is part of the cache key, so a prompt change never serves a stale
   output.
@@ -294,6 +306,113 @@ To demo: write `config/ai` with `enabled: true` and
 open My listing → Basics, paste a sample business text (the test
 file has one), review, apply, and Save as usual.
 
+## Voice: voice-brief + voice-quote (2026-10-30, flag still OFF)
+
+The last MUST feature. Two surfaces, one pipeline:
+
+- **Customer** — "Describe it by voice" on get-quote step 2
+  (`src/components/ai/VoiceBrief.tsx`, beside C1's SnapPhotoBrief):
+  record in the browser (MediaRecorder, feature-detected) or pick
+  an audio file, get a brief, land in the SAME apply-or-dismiss
+  suggestion card C1 uses.
+- **Business** — "Draft by voice" on a lead
+  (`src/components/ai/VoiceQuote.tsx`, beside B2's QuoteAiDraft):
+  spoken notes + the same composed context B2 sends (job text, B1
+  brief, the business's OWN servicePrices) → draft line items
+  through `applyQuoteDraft()` — the identical own-prices guard, so
+  a spoken price that is not in the business's own list is blanked
+  and flagged, never kept. AI never sends.
+- Client helpers + the recorder live in `src/lib/ai/voice-ai.ts`
+  (tests: `tests/ai-voice.test.mjs`, 15 tests).
+
+### How a recording flows (and where the privacy lines are)
+
+1. The browser caps recordings at ~60 s of UI guidance and a hard
+   4 MB size check (`audioSizeProblem`), encodes the blob as an
+   `audioDataUri`, and posts it to `/api/ai` like every feature —
+   auth, role gate, flag, daily cap all apply unchanged.
+2. The route measures the recording against its own cap
+   (`MAX_AUDIO_DATA_URI_CHARS`, 6M chars ≈ 4.5 MB decoded) instead
+   of the 50k JSON cap, and puts a SHA-256 of the payload in the
+   cache key in place of the payload — two different recordings
+   can never collide into one cached brief, and no audio is ever
+   stored.
+3. The gateway lifts `audioDataUri` out of voice-feature inputs
+   BEFORE the PII strip and re-attaches it untouched: base64 is
+   opaque, and the strip's digit-chain rule would corrupt it (a
+   run of 8+ digits inside base64 looks exactly like a phone/ID
+   chain). This is the one deliberate gateway change; every other
+   feature's stripped input is byte-identical to before.
+4. The provider transcribes (`callTranscribe`, below), then
+   PII-strips the TRANSCRIPT — a phone number said out loud
+   reaches the brief/quote model only as `[phone removed]` — then
+   runs the normal verified chat call (context text + labelled
+   transcript). The stripped transcript is attached to the output
+   (`output.transcript`) so the UI can show "This is what we
+   heard — fix anything" in an editable box; the copy the route
+   caches is therefore stripped too. Correcting the transcript
+   and drafting again is a TEXT-ONLY call (no audio), which is
+   also why voice features still accept a plain `transcript`
+   input with no recording involved.
+5. We do not store recordings anywhere: the blob lives in the
+   component for the one call, the route never persists input,
+   and the only stored artefact is the validated (stripped)
+   output in `aiCache`, as for every feature.
+
+### The transcription transport — VERIFIED LIVE 2026-10-30
+
+`callTranscribe()` in `src/lib/ai/provider.ts` posts
+`multipart/form-data` to `POST /v1/asr/transcribe` with exactly two
+parts (contract from Meta's official cookbook,
+meta-models/meta-model-cookbook `06_muse_voice/01_voice_api_fundamentals`,
+confirmed by a live call):
+
+- `request`: a JSON part (no filename, content-type
+  application/json): `{ "mode": "PUSH_TO_TALK", "model":
+  "muse-voice-transcribe-1.0", "audioEncoding": "WAV" }`.
+- `audio`: the recording as a WAV file part (Bearer auth, NO
+  manual Content-Type — the runtime sets the multipart boundary).
+
+WAV only: mono 16-bit, 16 kHz accepted (native 24 kHz, resampled
+server-side); caps 32 MB / 10 minutes. Browsers record webm/m4a,
+so the client converts every recording or picked file to mono
+16 kHz WAV before upload (`blobToWavDataUri` in
+`src/lib/ai/voice-ai.ts`: WebAudio decode + offline resample +
+`encodeWavDataUri`). The provider rejects a non-WAV payload
+before any network call. Response: `{ sessionId, transcript,
+audioDurationMs, turns? }` — the flat `transcript` string is what
+we read. AbortController timeout is `timeoutForFeature(feature)`
+(45 s for voice features — the budget covers transcribe + the
+brief/quote chat call chained after it).
+
+**Verification (parent, 2026-10-30):** the assumed
+OpenAI-compatible shape (`/v1/audio/transcriptions`, `file` part)
+returned 404; probing found the real endpoint, whose error
+messages plus the cookbook pinned the contract above. A direct
+call with a 7 s synthesized test sentence returned HTTP 200 with
+the sentence transcribed correctly (the robotic TTS voice's "Hi"
+came back as "By"; every content word, including "Casuarina",
+was exact). The full-stack flag-on proof through `/api/ai`
+follows the same pattern as the other features. Failure remains
+safe by construction: any non-200 / timeout / unexpected body
+throws, the gateway retries once, then falls back, and both UIs
+say voice is unavailable while typing keeps working.
+
+### Fallback behaviour (what the parent should check)
+
+- Flag OFF (the default): Record/Upload still work locally, the
+  call returns fallback, and each surface shows ONE quiet note
+  ("Voice brief is switched off right now — type the description
+  instead" / "Voice draft is switched off right now — add line
+  items manually"). The get-quote form and the quote builder are
+  byte-for-byte their pre-voice selves.
+- No microphone permission / no MediaRecorder: the Record button
+  is replaced by an explanation + the audio file pick (the pick is
+  always available). Denied permission shows a plain note.
+- Mock provider (no key): a recording yields the mock brief and
+  the mock note; no transcript box appears (the mock cannot
+  transcribe, and no transcript is invented).
+
 ## Open items (D1, recorded honestly)
 
 - NT gas/electricity utility emergency numbers are NOT in the safety
@@ -323,3 +442,8 @@ file has one), review, apply, and Save as usual.
 - The `~` lossless SAM mask encoding is not decoded (see provider
   section); if live SAM traffic returns it, masks come back null
   with `samStatus: 'unsupported-encoding'` rather than wrong.
+- The transcription endpoint shape was VERIFIED live 2026-10-30
+  (see the Voice section): `POST /v1/asr/transcribe` with a JSON
+  `request` part + a WAV `audio` part, `{ transcript }` back. The
+  originally assumed `/v1/audio/transcriptions` shape 404s — do
+  not resurrect it.

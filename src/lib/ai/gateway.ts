@@ -98,10 +98,11 @@ export const STANDARD_MODEL_ALLOWLIST: readonly string[] = [
   'muse-spark-1.1', // Fallback only.
   'sam-3.1', // Segmentation for photo-brief only.
   'muse-image-1.0', // Image-preview only.
-  // Transcription transport is NOT built yet — voice features take
-  // transcripts today, and transcription plugs in before this
-  // gateway (see prompts.ts). Listed so the allow-list matches the
-  // verified Standard-tier model set; nothing routes to it yet.
+  // Transcription for the voice features: the real provider's
+  // callTranscribe() posts to /v1/audio/transcriptions (built to
+  // the OpenAI-compatible shape — UNVERIFIED against the live API
+  // until the parent smoke test; see docs/ai-gateway.md). Voice
+  // features still accept a plain transcript with no audio at all.
   'muse-voice-transcribe-1.0',
 ];
 
@@ -337,7 +338,10 @@ export interface AiProvider {
 
 function mockBrief(input: unknown): Record<string, unknown> {
   // Voice features pass a transcript; photo briefs pass text. Both are
-  // plain text in D1 — no audio bytes are handled anywhere.
+  // plain text here — the mock never handles audio bytes: a voice
+  // call carrying an audioDataUri gets this same mock brief from its
+  // text fields (the real provider transcribes first, then strips
+  // the transcript — see provider.ts).
   const record =
     typeof input === 'object' && input !== null ? (input as Record<string, unknown>) : {};
   const text =
@@ -455,13 +459,17 @@ export function isValidAiOutput(feature: AiFeature, output: unknown): boolean {
 // paste-to-profile is the exception: a full extraction plus SEO copy
 // measured 23.7s on a live call (2026-10-30 flag-on proof — the reply
 // validated perfectly but arrived after the 15s budget, so both
-// attempts timed out and the feature fell back). It gets 60s.
+// attempts timed out and the feature fell back). It gets 60s. Voice
+// features chain TWO calls (transcribe, then the brief/quote chat),
+// so they get 45s.
 // ---------------------------------------------------------------------------
 
 export const AI_TIMEOUT_MS = 15_000;
 
 export const FEATURE_TIMEOUT_MS: Partial<Record<AiFeature, number>> = {
   'paste-to-profile': 60_000,
+  'voice-brief': 45_000,
+  'voice-quote': 45_000,
 };
 
 export function timeoutForFeature(feature: AiFeature): number {
@@ -531,7 +539,31 @@ export async function runAiFeature(args: {
   }
 
   // PII strip FIRST — the cache key below is computed from stripped input.
-  const strippedInput = stripPiiDeep(args.input);
+  //
+  // Voice features may carry a recording as an `audioDataUri` string.
+  // Base64 is opaque payload, and the strip would corrupt it: a run
+  // of 8+ digits inside base64 is indistinguishable from the "long
+  // digit chain" the strip removes. So the audio is lifted out
+  // before stripping and re-attached untouched, for voice features
+  // only. No unstripped TEXT reaches a model or a stored doc either
+  // way: the provider transcribes the audio and PII-strips the
+  // TRANSCRIPT before any brief/quote model call (see provider.ts).
+  let audioDataUri: string | null = null;
+  let stripTarget: unknown = args.input;
+  if (
+    (feature === 'voice-brief' || feature === 'voice-quote') &&
+    isRecord(args.input) &&
+    typeof args.input.audioDataUri === 'string'
+  ) {
+    const { audioDataUri: lifted, ...rest } = args.input;
+    audioDataUri = lifted;
+    stripTarget = rest;
+  }
+  const strippedRest = stripPiiDeep(stripTarget);
+  const strippedInput =
+    audioDataUri !== null && isRecord(strippedRest)
+      ? { ...strippedRest, audioDataUri }
+      : strippedRest;
   const strippedText = JSON.stringify(strippedInput);
   const safetyCardShown = detectSafety(strippedText);
   const cacheKey = aiCacheKey(feature, model, strippedInput, promptVersion);

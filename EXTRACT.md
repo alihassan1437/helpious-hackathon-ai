@@ -5,8 +5,11 @@ Developer Hackathon window (26 October – 4 November 2026, Darwin time)
 for the Startup track, theme "Build for Your World".
 
 It is a mirror of the AI surface as it exists in the host app today
-(synced 30 October 2026; round 2 sync later the same day added B7
-paste-to-profile and the per-feature timeout fix). Paths are
+(synced 30 October 2026; the round 2 sync later the same day added
+B7 paste-to-profile and the per-feature timeout fix; the round 3
+sync, also 30 October 2026, added voice — "Describe it by voice"
+for customers and "Draft by voice" for tradies — including the
+verified transcription contract described below). Paths are
 preserved from the host app.
 
 Contents:
@@ -17,8 +20,11 @@ Contents:
   means OFF), cache-before-cap, daily caps, per-job image cap, PII
   strip before cache and model, SHA-256 cache key including
   promptVersion, per-feature timeout budget (15s default;
-  paste-to-profile 60s — see the timeout note below), one repair
-  retry, `{fallback: true}`.
+  paste-to-profile 60s, voice features 45s — see the timeout note
+  below), one repair retry, `{fallback: true}`. Voice calls are
+  measured against their own larger audio cap, and only a SHA-256
+  of the audio payload enters the route's cache key — recordings
+  themselves are never stored.
 - `src/lib/ai/gateway.ts` — the pure gateway core: feature allow-list,
   Standard-tier model allow-list (any `-contributor` ID rejected),
   PII strip, fixed C3 safety card, output validation, the per-feature
@@ -29,9 +35,11 @@ Contents:
   `/v1/chat/completions`, SAM 3.1 segmentation via the streaming
   `/v1/responses` API (non-streaming returns an empty lane, so
   streaming is mandatory; a zero-match empty lane is a valid empty
-  result, never an error), and Muse Image via
+  result, never an error), Muse Image via
   `/v1/images/generations` (the API returns WebP bytes; the mime is
-  sniffed and returned explicitly, never assumed). Its transport
+  sniffed and returned explicitly, never assumed), and voice
+  transcription via `/v1/asr/transcribe` (added 30 October 2026;
+  see the voice note below). Its transport
   (`postJson`) takes a per-feature timeout from the gateway's
   `timeoutForFeature`, so the transport abort and the gateway
   budget can never disagree. Standard tier
@@ -52,7 +60,8 @@ Contents:
   (`FEATURE_TIMEOUT_MS` in the gateway) and makes the provider
   transport use that same budget. The third proof then passed
   through the full production stack (real extraction, zero contact
-  details leaked).
+  details leaked). Voice features chain two model calls
+  (transcribe, then chat), so they get a 45s budget the same way.
 - `src/lib/ai/business-ai.ts` — B1/B2 helpers shared by the Leads UI
   and the tests. Two honesty rules are enforced here: B1 input is
   the job's description text plus category and suburb ONLY (callers
@@ -108,8 +117,47 @@ Contents:
   flow. Contact details are structurally absent: the review screen
   explains that phone/email/ABN/licence were removed before the AI
   saw the text and must be entered in the form directly.
+- `src/lib/ai/voice-ai.ts` — voice helpers (client-side): a
+  `MediaRecorder` wrapper with a 4MB cap and ~60s guidance, data-URI
+  handling, transcript helpers, and the WAV conversion —
+  browsers record webm/m4a, but the transcription endpoint accepts
+  WAV only, so recordings are decoded with WebAudio, resampled to
+  mono 16 kHz, and re-encoded as 16-bit PCM WAV in the browser
+  before upload (the WAV encoder is unit-tested). Recordings are
+  never stored; the UI says so.
+- `src/components/ai/VoiceBrief.tsx` — voice for customers:
+  "Describe it by voice" on the get-quote flow. The transcript
+  comes back into an editable box; the customer can correct it and
+  re-draft, and nothing is ever auto-submitted — the normal form
+  and submit are unchanged. A file-pick fallback covers browsers
+  without `MediaRecorder`.
+- `src/components/ai/VoiceQuote.tsx` — voice for tradies: "Draft by
+  voice" on a lead. The spoken job notes are transcribed, then fed
+  through the SAME B2 quote-draft path, including the unchanged
+  own-prices-only guard (`applyQuoteDraft`) — a spoken price that
+  is not in the business's own price list is stripped exactly like
+  a typed one. AI never sends; the tradie reviews and sends.
+- Voice transcription note (verified live 2026-10-30): the
+  transcription contract was NOT assumed. The first version was
+  built to the familiar OpenAI-style shape
+  (`POST /v1/audio/transcriptions`) and failed — that path 404s on
+  the Meta Model API. The real contract was taken from Meta's
+  official model cookbook (`meta-models/meta-model-cookbook`,
+  `06_muse_voice`): `POST /v1/asr/transcribe` as multipart form
+  data with a `request` JSON part (`{mode: "PUSH_TO_TALK", model,
+  audioEncoding: "WAV"}`) plus an `audio` WAV part, returning a
+  flat `transcript` string; input must be mono 16-bit PCM WAV at
+  16 or 24 kHz. It was verified three ways before this sync: a
+  direct live API call, a unit-tested client WAV encoder, and a
+  full-stack proof through the deployed `/api/ai` (synthesised
+  speech in → transcript back → correct Plumber/Urgent brief out,
+  in 11.3s). The provider rejects non-WAV payloads before any
+  network call, and the transcript is PII-stripped before it
+  reaches the brief/quote model — a spoken phone number arrives at
+  the model only as `[phone removed]`. The cache stores only the
+  stripped transcript, never the audio.
 - Tests (no network, no real key; provider tests use an injected
-  stub fetch):
+  stub fetch) — six suites, 83 tests:
   - `tests/ai-gateway.test.mjs` — 17 tests, `node tests/ai-gateway.test.mjs`
   - `tests/ai-d2.test.mjs` — 6 tests, `node tests/ai-d2.test.mjs`
   - `tests/ai-b1b2.test.mjs` — 14 tests, `node tests/ai-b1b2.test.mjs`
@@ -119,17 +167,24 @@ Contents:
     `node --import ./tests/register.mjs tests/ai-provider.test.mjs`
     (`tests/register.mjs` + `tests/ts-resolve-loader.mjs` are the
     small Node loader that resolves the sources' extensionless
-    `.ts` imports; the provider and B7 tests also need the app's
-    `zod` dependency present.)
+    `.ts` imports; the provider, B7 and voice tests also need the
+    app's `zod` dependency present.)
+  - `tests/ai-voice.test.mjs` — 16 tests,
+    `node --import ./tests/register.mjs tests/ai-voice.test.mjs`
+    (covers the verified `/v1/asr/transcribe` request shape, the
+    WAV encoder, non-WAV rejection before any network call, the
+    transcript PII strip, and the 45s voice budgets.)
 - `docs/ai-gateway.md` — gateway + provider documentation,
   including measured smoke-test costs and the honest open items.
 
-## How B1/B2 and B7 are wired in the host app (and why the wiring pages are not here)
+## How B1/B2, B7 and voice are wired in the host app (and why the wiring pages are not here)
 
 `LeadAiBrief` and `QuoteAiDraft` are mounted by the host app's
 business Leads page (`src/app/business/leads/page.tsx` in the host
 repo). `PasteToProfile` is mounted by the host app's My listing
-page (the business profile editor). Both are pre-existing
+page (the business profile editor). `VoiceBrief` is mounted by the
+host app's get-quote page, and `VoiceQuote` by the same Leads page
+as B1/B2. All of those are pre-existing
 marketplace pages full of non-AI
 code (lead lists, filters, the quote builder itself), so they are NOT
 copied here — the same treatment the `/api/ai` route's host helper
@@ -154,7 +209,8 @@ Also deliberately not copied:
 
 - Host-app pages that mount the AI components (the Leads page
   above; the My listing page that mounts `PasteToProfile`; the
-  get-quote page that mounts `SnapPhotoBrief`). They are
+  get-quote page that mounts `SnapPhotoBrief` and `VoiceBrief`).
+  They are
   marketplace pages, not AI work.
 - The host's Firebase/Admin helpers — the `/api/ai` route imports
   `@/lib/server-admin` for auth and Firestore. That module is host
@@ -168,7 +224,9 @@ This repo is the hackathon-window AI work only, not a runnable app.
 The gateway core (`src/lib/ai/gateway.ts`), the B1/B2 helpers, the
 B7 helpers, and
 the D2 pure modules are dependency-free (node:crypto only) and are
-fully runnable and tested on their own; the provider needs `zod`;
+fully runnable and tested on their own; the pure parts of
+`voice-ai.ts` (WAV encoder, data-URI handling) are likewise tested
+standalone, while its recorder parts need a browser; the provider needs `zod`;
 the components need React (and `lucide-react`); the route shows
 exactly how the host wires everything (auth, flags, caps, cache,
 usage) but imports host modules that are not here.

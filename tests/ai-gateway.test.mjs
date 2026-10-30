@@ -167,12 +167,14 @@ tests.push(() => check('timeout: a hung provider falls back within budget', asyn
   assert.equal(r.fallback.fallback, true);
   assert.ok(Date.now() - start < 5000, `took ${Date.now() - start}ms`);
 }));
-tests.push(() => check('timeout budgets: paste-to-profile gets 60s, everything else the 15s default', async () => {
+tests.push(() => check('timeout budgets: paste-to-profile 60s, voice features 45s, everything else the 15s default', async () => {
   const { timeoutForFeature, AI_TIMEOUT_MS, FEATURE_TIMEOUT_MS } = await import('../src/lib/ai/gateway.ts');
   assert.equal(timeoutForFeature('paste-to-profile'), 60_000);
+  assert.equal(timeoutForFeature('voice-brief'), 45_000);
+  assert.equal(timeoutForFeature('voice-quote'), 45_000);
   assert.equal(timeoutForFeature('photo-brief'), AI_TIMEOUT_MS);
   assert.equal(timeoutForFeature('quote-draft'), AI_TIMEOUT_MS);
-  assert.deepEqual(Object.keys(FEATURE_TIMEOUT_MS), ['paste-to-profile']);
+  assert.deepEqual(Object.keys(FEATURE_TIMEOUT_MS).sort(), ['paste-to-profile', 'voice-brief', 'voice-quote']);
 }));
 
 for (const t of tests) await t();

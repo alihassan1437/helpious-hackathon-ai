@@ -20,6 +20,11 @@
 //   - Image: POST /v1/images/generations. The API returns JSON with
 //     data[0].b64_json whose bytes are WEBP, not JPEG — the mime is
 //     sniffed from the bytes and returned explicitly, never assumed.
+//   - Transcription: POST /v1/asr/transcribe (multipart: a JSON
+//     `request` part + an `audio` part holding a WAV file). VERIFIED
+//     live 2026-10-30 against Meta's official cookbook contract
+//     (meta-models/meta-model-cookbook, 06_muse_voice) — see
+//     callTranscribe below.
 //
 // Standard tier ONLY: every call checks isStandardModel() and fails
 // closed on any Contributor ID (the route checks too). Missing key
@@ -40,6 +45,7 @@ import { getPrompt } from './prompts';
 import {
   isStandardModel,
   mockAiProvider,
+  stripPii,
   timeoutForFeature,
   type AiFeature,
   type AiProvider,
@@ -75,7 +81,9 @@ export type MetaFetch = (
   init: {
     method: string;
     headers: Record<string, string>;
-    body: string;
+    // string for the JSON transports; FormData for the multipart
+    // transcription upload (the runtime sets the boundary itself).
+    body: string | FormData;
     signal: AbortSignal;
   },
 ) => Promise<MetaFetchResponse>;
@@ -501,6 +509,14 @@ function inputImageDataUri(input: unknown): string | null {
   return null;
 }
 
+function inputAudioDataUri(input: unknown): string | null {
+  if (input !== null && typeof input === 'object') {
+    const uri = (input as Record<string, unknown>)['audioDataUri'];
+    if (typeof uri === 'string' && uri.startsWith('data:audio/')) return uri;
+  }
+  return null;
+}
+
 function inputStringField(input: unknown, key: string): string | null {
   if (input !== null && typeof input === 'object') {
     const value = (input as Record<string, unknown>)[key];
@@ -707,6 +723,156 @@ async function callImage(
 }
 
 // ---------------------------------------------------------------------------
+// Transcription (voice features) — POST /v1/asr/transcribe, model
+// muse-voice-transcribe-1.0. Multipart/form-data with TWO parts:
+//   - `request`: a JSON part (no filename, content-type
+//     application/json): { mode: 'PUSH_TO_TALK', model, audioEncoding:
+//     'WAV' }.
+//   - `audio`: the recording as a WAV file (mono 16-bit; the engine
+//     is native 24 kHz and resamples 16 kHz server-side). The browser
+//     cannot record WAV, so the client converts every recording to
+//     mono 16 kHz WAV before upload (see voice-ai.ts
+//     blobToWavDataUri); this function rejects anything that is not
+//     WAV rather than letting the endpoint fail opaquely.
+// Response: { sessionId, transcript, audioDurationMs, turns? } — the
+// transcript is the flat string field.
+//
+// VERIFIED LIVE 2026-10-30 (parent): contract taken from Meta's
+// official cookbook (meta-models/meta-model-cookbook,
+// 06_muse_voice/01_voice_api_fundamentals/utils.py) and confirmed
+// with a real call — a 7s synthesized test sentence came back
+// transcribed correctly. Earlier guesses (/v1/audio/transcriptions,
+// a `file` part, a `model` form field) all fail against the real
+// API, which is why this shape is now locked by tests. Any non-200,
+// timeout, abort, or unexpected body still throws here so the
+// gateway falls back and the typed/manual path keeps working.
+// ---------------------------------------------------------------------------
+
+export const TRANSCRIBE_MODEL = 'muse-voice-transcribe-1.0';
+/** Mirrors the UI-side cap in src/lib/ai/voice-ai.ts (4 MB). */
+export const MAX_AUDIO_BYTES = 4 * 1024 * 1024;
+
+const AUDIO_FILENAME_BY_MIME: Record<string, string> = {
+  'audio/webm': 'recording.webm',
+  'audio/mp4': 'recording.m4a',
+  'audio/m4a': 'recording.m4a',
+  'audio/x-m4a': 'recording.m4a',
+  'audio/mpeg': 'recording.mp3',
+  'audio/mp3': 'recording.mp3',
+  'audio/wav': 'recording.wav',
+  'audio/x-wav': 'recording.wav',
+  'audio/wave': 'recording.wav',
+  'audio/ogg': 'recording.ogg',
+  'audio/flac': 'recording.flac',
+};
+
+export interface ParsedAudioDataUri {
+  mime: string;
+  bytes: Uint8Array;
+  filename: string;
+}
+
+/**
+ * Parses a `data:audio/<type>[;params];base64,<payload>` URI — the
+ * shape the browser produces from a MediaRecorder blob or an audio
+ * file pick (FileReader.readAsDataURL). Returns null on anything
+ * that is not a non-empty base64 audio payload; never a partial
+ * parse, so a malformed recording fails before any network call.
+ */
+export function parseAudioDataUri(uri: unknown): ParsedAudioDataUri | null {
+  if (typeof uri !== 'string') return null;
+  const match = uri.match(/^data:([^;,]+)?((?:;[^;,]+)*);base64,([A-Za-z0-9+/=\s]+)$/);
+  if (!match) return null;
+  const mime = (match[1] ?? '').toLowerCase();
+  if (!mime.startsWith('audio/')) return null;
+  const payload = (match[3] ?? '').replace(/\s/g, '');
+  if (payload === '') return null;
+  let bytes: Uint8Array;
+  try {
+    const buf = Buffer.from(payload, 'base64');
+    bytes = new Uint8Array(buf.byteLength);
+    bytes.set(buf);
+  } catch {
+    return null;
+  }
+  if (bytes.length === 0) return null;
+  const subtype = mime.slice('audio/'.length);
+  const filename =
+    AUDIO_FILENAME_BY_MIME[mime] ??
+    (/^[a-z0-9]+$/.test(subtype) ? `recording.${subtype}` : 'recording.webm');
+  return { mime, bytes, filename };
+}
+
+/**
+ * The one and only transcription call. Throws on ANY problem —
+ * unreadable recording, oversize, non-200, unexpected body, timeout
+ * — so the gateway's normal retry/fallback discipline applies and
+ * the user is never blocked on voice.
+ */
+export async function callTranscribe(
+  fetchImpl: MetaFetch,
+  apiKey: string,
+  audioDataUri: unknown,
+  timeoutMs: number = PROVIDER_TIMEOUT_MS,
+): Promise<string> {
+  if (!isStandardModel(TRANSCRIBE_MODEL)) {
+    throw new Error('Transcription model is not on the Standard-tier allow-list.');
+  }
+  const parsed = parseAudioDataUri(audioDataUri);
+  if (!parsed) throw new Error('Recording could not be read.');
+  if (parsed.bytes.length > MAX_AUDIO_BYTES) throw new Error('Recording is too large.');
+  if (parsed.mime !== 'audio/wav' && parsed.mime !== 'audio/x-wav' && parsed.mime !== 'audio/wave') {
+    // The endpoint's WAV mode reads a WAV container; the client
+    // converts recordings to WAV before upload (voice-ai.ts), so a
+    // non-WAV payload here means a caller bypassed that conversion.
+    throw new Error('Recording was not WAV audio.');
+  }
+  const form = new FormData();
+  form.append(
+    'request',
+    new Blob(
+      [
+        JSON.stringify({
+          mode: 'PUSH_TO_TALK',
+          model: TRANSCRIBE_MODEL,
+          audioEncoding: 'WAV',
+        }),
+      ],
+      { type: 'application/json' },
+    ),
+  );
+  form.append(
+    'audio',
+    new Blob([parsed.bytes as unknown as BlobPart], { type: 'audio/wav' }),
+    'recording.wav',
+  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(META_API_BASE + '/asr/transcribe', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        // No Content-Type on purpose: the runtime must set the
+        // multipart Content-Type with its generated boundary.
+      },
+      body: form,
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`Meta API /asr/transcribe failed with HTTP ${res.status}.`);
+    if (typeof res.json !== 'function') throw new Error('Transcription response could not be read.');
+    const data = (await res.json()) as { transcript?: unknown };
+    if (typeof data.transcript !== 'string' || data.transcript.trim() === '') {
+      throw new Error('Transcription response had no text.');
+    }
+    return data.transcript;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Provider factory + selection
 // ---------------------------------------------------------------------------
 
@@ -733,6 +899,54 @@ export function createMetaProvider(apiKey: string, fetchImpl?: MetaFetch): AiPro
       if (feature === 'image-preview') {
         if (model !== 'muse-image-1.0') throw new Error('image-preview requires muse-image-1.0.');
         return callImage(fetchFn, apiKey, input);
+      }
+      // Voice features carrying a recording: transcribe FIRST, then
+      // run the normal chat call on the transcript. The transcript
+      // is PII-stripped here, before any brief/quote model sees it
+      // (the gateway lifts the base64 audio past its own strip
+      // untouched — the strip would corrupt base64 — so this is the
+      // strip point for spoken text: a phone number said out loud
+      // reaches the brief/quote model only as "[phone removed]").
+      // The STRIPPED transcript rides on the output so the UI can
+      // show "this is what we heard"; because it is stripped, the
+      // copy the route stores in aiCache holds no contact details
+      // either. A voice call WITHOUT audio is a plain transcript
+      // call and skips this entirely. Transcription failure throws,
+      // so the gateway retries once and then falls back — voice
+      // never blocks the manual form.
+      const audioUri = inputAudioDataUri(input);
+      if ((feature === 'voice-brief' || feature === 'voice-quote') && audioUri) {
+        const rawTranscript = await callTranscribe(
+          fetchFn,
+          apiKey,
+          audioUri,
+          timeoutForFeature(feature),
+        );
+        const transcript = stripPii(rawTranscript).cleaned;
+        if (transcript === '') throw new Error('Transcription returned no usable text.');
+        const rest: Record<string, unknown> = { ...(input as Record<string, unknown>) };
+        delete rest.audioDataUri;
+        // The callers' context (typed description for voice-brief,
+        // the composed job + price-list text for voice-quote) rides
+        // in `text`; anything else in rest is metadata the chat
+        // call ignores, so the text field is the context, verbatim.
+        const baseText = typeof rest.text === 'string' ? rest.text.trim() : '';
+        // The label matches SPOKEN_NOTES_LABEL in
+        // src/lib/ai/voice-ai.ts, which the client uses when it
+        // re-drafts from a user-corrected transcript (text-only).
+        const chatText =
+          baseText !== '' && baseText !== transcript
+            ? `${baseText}\n\nSpoken notes (transcript):\n${transcript}`
+            : transcript;
+        const chatOutput = await callChat(
+          fetchFn,
+          apiKey,
+          feature,
+          model,
+          { ...rest, text: chatText, transcript },
+          repair,
+        );
+        return { ...chatOutput, transcript };
       }
       const output = await callChat(fetchFn, apiKey, feature, model, input, repair);
       // Photo-brief SAM step: only when the caller supplies both a

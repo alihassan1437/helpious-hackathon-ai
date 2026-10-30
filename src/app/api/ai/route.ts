@@ -41,6 +41,7 @@
 // flag check above still returns fallback for real users either way.
 
 import { NextResponse } from 'next/server';
+import { createHash } from 'node:crypto';
 import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 import { z } from 'zod';
 import { getAdminDb, verifyUserRequest } from '@/lib/server-admin';
@@ -64,6 +65,7 @@ import {
 
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days.
 const MAX_INPUT_JSON_CHARS = 50_000; // Paste inputs are capped ~15k in the browser; this is a server backstop.
+const MAX_AUDIO_DATA_URI_CHARS = 6_000_000; // A 4 MB recording is ~5.6M base64 chars; the UI caps recordings at 4 MB.
 const IMAGE_PREVIEWS_PER_JOB = 2;
 
 const bodySchema = z.object({
@@ -159,7 +161,35 @@ export async function POST(req: Request) {
 
   // PII strip BEFORE cache lookup and before any model call. The raw
   // input is never stored, never cached, never sent anywhere.
-  const strippedInput = stripPiiDeep(body.input);
+  //
+  // Voice features may carry a recording as an audioDataUri string.
+  // Base64 of a 4 MB clip is ~5.6M chars — over the JSON cap above by
+  // design — so the recording is measured against its own cap, and
+  // the cache key / safety scan use a SHA-256 of it in place of the
+  // payload (the payload itself is never stored; the gateway lifts
+  // it past the PII strip untouched and the provider transcribes
+  // it). Everything else about this block is unchanged.
+  let stripSource: unknown = body.input;
+  if (
+    (feature === 'voice-brief' || feature === 'voice-quote') &&
+    body.input !== null &&
+    typeof body.input === 'object' &&
+    !Array.isArray(body.input) &&
+    typeof (body.input as Record<string, unknown>).audioDataUri === 'string'
+  ) {
+    const record = body.input as Record<string, unknown>;
+    const audioDataUri = record.audioDataUri as string;
+    if (audioDataUri.length > MAX_AUDIO_DATA_URI_CHARS) {
+      return userError('Recording is too large.');
+    }
+    const rest: Record<string, unknown> = { ...record };
+    delete rest.audioDataUri;
+    stripSource = {
+      ...rest,
+      audioSha256: createHash('sha256').update(audioDataUri, 'utf8').digest('hex'),
+    };
+  }
+  const strippedInput = stripPiiDeep(stripSource);
   if (JSON.stringify(strippedInput).length > MAX_INPUT_JSON_CHARS) {
     return userError('Input is too large.');
   }
