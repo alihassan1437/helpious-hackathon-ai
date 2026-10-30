@@ -17,7 +17,9 @@ ships to the browser.
   module top level, so a missing key can never throw at import time
   and kill the App Hosting build. Missing key = mock, never a crash.
 - Chat: `POST /v1/chat/completions`, Bearer key, temperature 0,
-  15s timeout, one repair retry, then fallback. Strict zod schemas
+  per-feature timeout (15s default; paste-to-profile 60s — its live
+  extraction + SEO reply measured 23.7s and timed out at 15s), one
+  repair retry, then fallback. Strict zod schemas
   mirror the gateway's output shapes; a reply that fails validation
   throws so the gateway retries with a repair instruction.
 - Vision: the same endpoint with `image_url` data URIs (JPEG from
@@ -164,7 +166,8 @@ Not accepted in D1 (rejected as unknown until their build day):
 
 - Standard tier only: the model allow-list in `gateway.ts` rejects any
   ID outside the list and any ID ending in `-contributor`.
-- 15-second timeout per attempt; one repair retry on invalid output;
+- Per-feature timeout per attempt (15s default, 60s for
+  paste-to-profile); one repair retry on invalid output;
   then fallback. The user is never blocked on AI.
 - Strict output shapes (validated in `gateway.ts`; the real provider
   must mirror them with zod schemas): briefs, quote drafts (prices
@@ -220,6 +223,76 @@ untouched. To demo: write `config/ai` with `enabled: true` and
 `photo-brief`/`quote-draft` true, sign in as a business test
 account, open a lead (brief appears; second open is a cache hit),
 then Draft with AI in the quote panel.
+
+## B7 paste-to-profile (2026-10-30, flag still OFF)
+
+"Build my profile from pasted text" in My listing
+(`src/app/business/profile/page.tsx`, Basics tab) with the panel in
+`src/components/ai/PasteToProfile.tsx` and pure helpers in
+`src/lib/ai/profile-ai.ts` (tests: `tests/ai-b7.test.mjs`,
+14 tests).
+
+- **Provider reality check.** The transport already existed: the
+  real provider routed `paste-to-profile` through chat with the v1
+  prompt and a zod schema. The v1 contract was NOT review-ready:
+  `extracted` was an unvalidated record, `sourceSnippets` was a
+  flat list that could not be tied to a field, and the v1 prompt
+  asked for phone/email/ABN/licence "if present" — values the
+  gateway's PII strip makes impossible (see below) — while the
+  appended never-invent text forbade outputting them.
+- **v2 contract** (prompt `paste-to-profile-v2`; the gateway
+  version table bumped to match, which invalidates v1 cache
+  entries by design; provider zod schema tightened to mirror it):
+  a FIXED field set tied to the editor — businessName, category,
+  services, serviceAreas, openingHours (day → "HH:MM — HH:MM" or
+  "Closed", only stated days), yearsInBusiness, paymentMethods,
+  website, fromPrices (service → price phrase as written) — each
+  as `{ value, snippet }` with the exact supporting quote, plus
+  the seo block (description/tagline/metaTitle/metaDescription)
+  written from the extracted facts only, a `lowConfidence` field
+  list, and `removedContact`. A reply that does not match the v2
+  shape fails zod, gets the one repair retry, then falls back —
+  loose output never reaches the review screen.
+- **Contact details are structurally unextractable.** The strip
+  replaces phone/email/street-address with placeholders and digit
+  chains (an ABN, most licence numbers) with `[number removed]`
+  BEFORE the model sees the paste. The v2 prompt tells the model
+  what the placeholders mean: never output them, never invent a
+  replacement — instead list the kinds seen in `removedContact`
+  (phone / email / street address / ABN / licence number). The
+  review screen turns that into "add these in the form yourself"
+  (phone/email in Basics, ABN/licence under Verification). A bare
+  website is not stripped and IS extractable. Backstop in
+  `profile-ai.ts`: any returned value containing a placeholder is
+  dropped deterministically and reported, never applied.
+- **Review screen.** Each field shows its editable value, its
+  supporting quote, and a "Check carefully" flag when the model
+  flagged the field OR the quote cannot be found verbatim
+  (whitespace-insensitive) in the paste the user typed — an
+  unverifiable quote is treated as unverified, not as evidence.
+  Tagline/description are labelled "AI-written from your text"
+  (generated copy, no quote). Ticking is explicit and conservative:
+  fields whose form field already has content, low-confidence
+  fields, and opening hours start unticked; an extracted category
+  applies only on an exact match with a loaded Helpious category.
+  Applying fills the EXISTING form state only (hours/prices merge
+  over the current records); the business reviews and presses the
+  existing Save. AI never saves or publishes.
+- **Fallback.** Flag off / error / mock reply → one quiet note and
+  the editor works exactly as before. The mock still performs no
+  extraction, and the UI says so rather than presenting its empty
+  shape as a real "nothing found". A real empty extraction is a
+  valid result ("nothing usable found — fill the form manually").
+- **Not offered by the review screen:** the seo metaTitle /
+  metaDescription (the listing editor has no fields for them
+  today) and the editor's highlights/why-choose/FAQ fields (not in
+  the v2 extraction set). Both are recorded here rather than
+  silently dropped from the output shape.
+
+To demo: write `config/ai` with `enabled: true` and
+`paste-to-profile` true, sign in as the Demo Business account,
+open My listing → Basics, paste a sample business text (the test
+file has one), review, apply, and Save as usual.
 
 ## Open items (D1, recorded honestly)
 

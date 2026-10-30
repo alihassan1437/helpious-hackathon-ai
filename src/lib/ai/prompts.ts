@@ -47,9 +47,26 @@ export const AI_PROMPTS: Record<AiFeature, AiPrompt> = {
     outputShape: '{ lineItems: { description: string, price: number | null, priceMissing: boolean }[], total: number | null, notes: string }',
   },
   'paste-to-profile': {
-    version: 'paste-to-profile-v1',
-    system: `You extract listing fields from pasted business text: business name, category and extra categories, services list, from-prices ONLY if stated in the text, service areas/suburbs, opening hours, years in business, phone/website/email only if present, ABN if present (marked to verify), licence numbers (marked to verify), payment methods. Then write SEO copy from those facts only: a 150-250 word description, a short tagline, a meta title (60 characters or fewer), a meta description (140-160 characters), service descriptions, and FAQ suggestions, in plain Australian English, naming the real suburbs and services. No invented claims: never write best, No.1, licensed, or insured unless the text says so, and no keyword stuffing. Flag low-confidence fields. ${NEVER_INVENT}`,
-    outputShape: '{ extracted: object, seo: { description: string, tagline: string, metaTitle: string, metaDescription: string }, lowConfidence: string[], sourceSnippets: string[] }',
+    version: 'paste-to-profile-v2',
+    system: `You extract listing fields from text a business pasted about ITSELF (its website, Facebook page, or a document), in plain Australian English. Extract ONLY what the text actually states — nothing else exists. For every field you return, quote the exact snippet from the text that supports it. If the text does not state a field, leave that field out entirely; an empty extraction is a correct answer when the text says nothing usable.
+
+Fields to extract (keys exactly as written):
+- businessName: the trading name, as written.
+- category: the trade or industry the text states (for example "Plumbing").
+- services: the services the text lists or clearly describes, as a list of short phrases.
+- serviceAreas: suburbs or areas the text says the business services, as a list. Suburb names only — never a street address.
+- openingHours: only the days the text states, as an object keyed by full day name (Monday..Sunday), each value either "Closed" or a range in exactly this format: "09:00 — 17:00" (24-hour, space, em dash, space). Do not guess days the text omits.
+- yearsInBusiness: how long the business has traded, as a short phrase taken from the text (for example "10+ Years" or "Since 2012").
+- paymentMethods: payment methods the text names, as a list.
+- website: the business's website, ONLY if a web address is literally in the text.
+- fromPrices: prices the text states, as an object mapping the service named in the text to the price phrase as written (for example "From $120"). Never a price the text does not state.
+
+CONTACT DETAILS AND ID NUMBERS: for privacy, the text you receive has already had phone numbers, email addresses, street addresses, ABNs, and licence numbers replaced with placeholders such as [phone removed], [email removed], [address removed], or [number removed]. NEVER output the placeholder text or invent a value to replace it. Leave phone, email, street address, ABN, and licence number out of the extraction completely — the business enters those in the form itself. Instead, list in removedContact which kinds you saw as placeholders, using only these words: "phone", "email", "street address", "ABN", "licence number".
+
+Flag in lowConfidence any field (by its key) where the text is ambiguous, contradictory, or you are inferring rather than reading directly.
+
+Then write SEO copy from the extracted facts ONLY: a 150-250 word description, a short tagline, a meta title (60 characters or fewer), and a meta description (140-160 characters), naming the real suburbs and services from the extraction. No invented claims: never write best, No.1, licensed, insured, or guaranteed unless the text says so, and no keyword stuffing. ${NEVER_INVENT}`,
+    outputShape: '{ extracted: { [field]: { value: string | string[] | object, snippet: string } }, seo: { description: string, tagline: string, metaTitle: string, metaDescription: string }, lowConfidence: string[], removedContact: string[] }',
   },
   'voice-brief': {
     version: 'voice-brief-v1',

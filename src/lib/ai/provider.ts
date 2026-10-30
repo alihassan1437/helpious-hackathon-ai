@@ -40,11 +40,17 @@ import { getPrompt } from './prompts';
 import {
   isStandardModel,
   mockAiProvider,
+  timeoutForFeature,
   type AiFeature,
   type AiProvider,
 } from './gateway';
 
 export const META_API_BASE = 'https://api.meta.ai/v1';
+// Transport abort floor. The binding per-attempt budget is the
+// gateway's timeoutForFeature(feature): postJson callers pass it
+// through, because this abort — not the gateway wrapper — is what
+// actually kills a slow fetch (the paste-to-profile 60s budget only
+// took effect once this respected it too).
 export const PROVIDER_TIMEOUT_MS = 15_000;
 export const MAX_SAM_RASTER_PIXELS = 4_000_000;
 export const MAX_SAM_POLYGON_POINTS = 500;
@@ -407,16 +413,39 @@ const quoteSchema = z.object({
   notes: z.string(),
 });
 
+// B7 (paste-to-profile) v2 contract: a FIXED field set tied to the My
+// listing editor, every field carrying the exact snippet that supports
+// it. Unknown keys are stripped by zod; wrong-typed fields fail the
+// parse so the gateway does its one repair retry, then falls back —
+// a loose reply can never reach the review screen. Contact details
+// and ID numbers are structurally absent: the gateway's PII strip
+// replaces them with placeholders before the model sees the text, so
+// the model reports which kinds it saw in removedContact instead of
+// returning values.
+const pasteFieldString = z.object({ value: z.string(), snippet: z.string() });
+const pasteFieldList = z.object({ value: z.array(z.string()), snippet: z.string() });
+const pasteFieldRecord = z.object({ value: z.record(z.string()), snippet: z.string() });
+
 const pasteSchema = z.object({
-  extracted: z.record(z.unknown()),
+  extracted: z.object({
+    businessName: pasteFieldString.optional(),
+    category: pasteFieldString.optional(),
+    services: pasteFieldList.optional(),
+    serviceAreas: pasteFieldList.optional(),
+    openingHours: pasteFieldRecord.optional(),
+    yearsInBusiness: pasteFieldString.optional(),
+    paymentMethods: pasteFieldList.optional(),
+    website: pasteFieldString.optional(),
+    fromPrices: pasteFieldRecord.optional(),
+  }),
   seo: z.object({
     description: z.string(),
     tagline: z.string(),
     metaTitle: z.string(),
     metaDescription: z.string(),
   }),
-  lowConfidence: z.array(z.string()),
-  sourceSnippets: z.array(z.string()),
+  lowConfidence: z.array(z.string()).optional(),
+  removedContact: z.array(z.string()).optional(),
 });
 
 const comparisonSchema = z.object({
@@ -498,9 +527,10 @@ async function postJson(
   path: string,
   body: Record<string, unknown>,
   accept = 'application/json',
+  timeoutMs: number = PROVIDER_TIMEOUT_MS,
 ): Promise<MetaFetchResponse> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetchImpl(META_API_BASE + path, {
       method: 'POST',
@@ -598,7 +628,7 @@ async function callChat(
       { role: 'user', content: userContent },
     ],
     temperature: 0,
-  });
+  }, 'application/json', timeoutForFeature(feature));
   if (typeof res.json !== 'function') throw new Error('Chat response could not be read.');
   const data = (await res.json()) as {
     choices?: { message?: { content?: unknown } }[];
@@ -624,7 +654,7 @@ async function callImage(
     model: 'muse-image-1.0',
     prompt,
     size: '1024x1024',
-  });
+  }, 'application/json', timeoutForFeature('image-preview'));
   const contentType = res.headers?.get('content-type') ?? '';
   // Defensive path first: raw image bytes (content-type image/*).
   if (contentType.includes('image/') && typeof res.arrayBuffer === 'function') {
@@ -734,6 +764,7 @@ export function createMetaProvider(apiKey: string, fetchImpl?: MetaFetch): AiPro
                 metadata: { mask_encoding: 'one_bit', include_confidence: 'true' },
               },
               'text/event-stream',
+              timeoutForFeature(feature),
             );
             const lane = await readSseLane(samRes);
             const parsed = parseSamLane(

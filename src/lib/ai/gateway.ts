@@ -133,7 +133,7 @@ export const FEATURE_MODEL: Record<AiFeature, string> = {
 export const FEATURE_PROMPT_VERSION: Record<AiFeature, string> = {
   'photo-brief': 'photo-brief-v1',
   'quote-draft': 'quote-draft-v1',
-  'paste-to-profile': 'paste-to-profile-v1',
+  'paste-to-profile': 'paste-to-profile-v2',
   'voice-brief': 'voice-brief-v1',
   'voice-quote': 'voice-quote-v1',
   'safety-check': 'safety-check-v1',
@@ -450,10 +450,23 @@ export function isValidAiOutput(feature: AiFeature, output: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Call discipline: 15s timeout per attempt, ONE repair retry, then fallback.
+// Call discipline: per-attempt timeout, ONE repair retry, then fallback.
+// Most features answer in a few seconds, so the default budget is 15s.
+// paste-to-profile is the exception: a full extraction plus SEO copy
+// measured 23.7s on a live call (2026-10-30 flag-on proof — the reply
+// validated perfectly but arrived after the 15s budget, so both
+// attempts timed out and the feature fell back). It gets 60s.
 // ---------------------------------------------------------------------------
 
 export const AI_TIMEOUT_MS = 15_000;
+
+export const FEATURE_TIMEOUT_MS: Partial<Record<AiFeature, number>> = {
+  'paste-to-profile': 60_000,
+};
+
+export function timeoutForFeature(feature: AiFeature): number {
+  return FEATURE_TIMEOUT_MS[feature] ?? AI_TIMEOUT_MS;
+}
 
 export async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -500,7 +513,7 @@ export async function runAiFeature(args: {
   const model = FEATURE_MODEL[feature];
   const promptVersion = args.promptVersion ?? FEATURE_PROMPT_VERSION[feature];
   const provider = args.provider ?? mockAiProvider;
-  const timeoutMs = args.timeoutMs ?? AI_TIMEOUT_MS;
+  const timeoutMs = args.timeoutMs ?? timeoutForFeature(feature);
 
   if (!isStandardModel(model)) {
     // Unreachable with the current FEATURE_MODEL table, but the check
@@ -581,8 +594,8 @@ export async function runAiFeature(args: {
     } catch {
       // Timeout or provider failure: one repair retry covers invalid
       // JSON only in spirit — a second attempt after a timeout is
-      // still bounded (2 attempts x 15s) and then falls back. The user
-      // is never blocked on AI.
+      // still bounded (2 attempts x the per-feature budget) and then
+      // falls back. The user is never blocked on AI.
       repairAttempted = true;
     }
   }
