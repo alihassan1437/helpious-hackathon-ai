@@ -4,7 +4,54 @@ One endpoint is the only path from the app to any model: `POST /api/ai`.
 The browser never calls a model provider directly, and no model key ever
 ships to the browser.
 
-## D1 status: MOCK ONLY, FLAG OFF
+## Provider status: REAL PROVIDER WIRED, FLAG STILL OFF (2026-10-29)
+
+- The real provider lives in `src/lib/ai/provider.ts` and is selected
+  by the route via `selectAiProvider(process.env.MODEL_API_KEY)`:
+  key present = real Meta provider, key absent = the D1 mock. The
+  route's flag check still gates real users — provider selection
+  alone enables nothing, and with no `config/ai` doc every feature
+  still returns `{ fallback: true }`.
+- The key is read as `MODEL_API_KEY` only (never `META_API_KEY`,
+  which is a different tool's key). No client is constructed at
+  module top level, so a missing key can never throw at import time
+  and kill the App Hosting build. Missing key = mock, never a crash.
+- Chat: `POST /v1/chat/completions`, Bearer key, temperature 0,
+  15s timeout, one repair retry, then fallback. Strict zod schemas
+  mirror the gateway's output shapes; a reply that fails validation
+  throws so the gateway retries with a repair instruction.
+- Vision: the same endpoint with `image_url` data URIs (JPEG from
+  the browser pipeline, 1024px max). The caller supplies
+  `imageDataUri` in the input; without it the call is text-only.
+- SAM: `POST /v1/responses`, model `sam-3.1`, `stream: true`,
+  metadata `mask_encoding: one_bit` + `include_confidence: true`.
+  STREAMING IS MANDATORY — the non-streaming call returns an empty
+  text lane. The streamed lane (`<Nf>id<|box;...|><|mask;...|>`) is
+  parsed into the normalised 0..1 polygon shape from `mask.ts`
+  (row-silhouette outline of the largest set-pixel component; the
+  raster is a crop of the SAM box, mapped through the box into frame
+  coords when the caller supplies `frameWidth`/`frameHeight`).
+  A zero-match empty lane is a VALID empty result (`mask: null`,
+  `samStatus: 'zero-match'`), never an error. SAM failure likewise
+  never fails the brief — the brief is valid without a mask.
+  The `~` lossless mask encoding is NOT decoded (its byte layout is
+  not documented well enough to decode honestly) and yields
+  `samStatus: 'unsupported-encoding'`, not a mask.
+- Image: `POST /v1/images/generations`, model `muse-image-1.0`,
+  1024x1024. The API returns JSON with `data[0].b64_json` whose
+  bytes are WEBP, not JPEG — the mime is sniffed from the bytes and
+  returned explicitly (`imageMime` + `imageDataUri`), never assumed.
+- Models (Standard tier only, enforced in both gateway and
+  provider): `muse-spark-1.3` (default), `muse-spark-1.2`,
+  `muse-spark-1.1`, `sam-3.1`, `muse-image-1.0`,
+  `muse-voice-transcribe-1.0` (allow-listed; transcription transport
+  not yet built — voice features take transcripts today). Any
+  `*-contributor` ID is rejected before any network call.
+- Measured smoke-test costs (2026-10-28, Standard rates, test data
+  only): vision brief ~$0.008, SAM $0.0025/image. Credit balance
+  confirmed 2026-10-28: $149.95 remaining of the $150 credit.
+
+## D1 status: MOCK ONLY, FLAG OFF (superseded — see above)
 
 - There is no real API key yet. The gateway's provider is a deterministic
   mock (`mockAiProvider` in `src/lib/ai/gateway.ts`): no network call, no
@@ -130,12 +177,49 @@ Not accepted in D1 (rejected as unknown until their build day):
 ## Enabling a feature (later days, not D1)
 
 1. A real Standard-tier key exists and the retention terms are read.
+   (Both done 2026-10-28: key wired as `MODEL_API_KEY`, terms read
+   from Meta's primary documents, privacy policy updated.)
 2. The real provider is wired behind the `AiProvider` interface, with
-   the allow-list check intact.
+   the allow-list check intact. (Done 2026-10-29: `src/lib/ai/provider.ts`.)
 3. The feature's prompts are reviewed in `src/lib/ai/prompts.ts` and its
   version bumped (which invalidates old cache entries by design).
 4. The `config/ai` doc is written with `enabled: true` and that
    feature `true`. Verify with a test account and test data first.
+
+## B1/B2 business wiring (2026-10-30, flag still OFF)
+
+The first product surfaces on this gateway, both in the business
+Leads page (`src/app/business/leads/page.tsx`) with pure helpers in
+`src/lib/ai/business-ai.ts` (tests: `tests/ai-b1b2.test.mjs`):
+
+- **B1 lead brief** (`src/components/ai/LeadAiBrief.tsx`): when a
+  business opens a lead, it calls `photo-brief` with the job
+  description + category + suburb only — never customer contact
+  details. The gateway cache makes it once-per-job: repeat views
+  are cache hits. On fallback the component renders the exact
+  pre-B1 "No brief yet" placeholder, so the lead page is unchanged
+  while the flag is off. A generated brief is a read-only, labelled
+  "AI suggestion" card (trade, summary, scope, urgency, access
+  notes, questions, missing photos), plus the fixed C3 safety card
+  when the gateway flags danger words.
+- **B2 quote draft** (`src/components/ai/QuoteAiDraft.tsx`): the
+  quote panel's "Draft with AI" calls `quote-draft` with the job
+  text, the B1 brief when present, and the business's OWN
+  `servicePrices` verbatim. Prices are guarded twice: the prompt
+  restricts the model to the list, and `applyQuoteDraft()` strips
+  any returned price whose number is not in the business's own
+  price strings (blanked + "add your price" state in the builder,
+  with the removal counted and stated in the UI). Draft items
+  append as editable line items; Send Quote is untouched and
+  remains a human action. On fallback the box shows one quiet
+  "AI draft unavailable" note and the builder works as before.
+
+Prompts were NOT changed for B1/B2 (the v1 texts already encode
+the rules), so promptVersions and existing cache entries are
+untouched. To demo: write `config/ai` with `enabled: true` and
+`photo-brief`/`quote-draft` true, sign in as a business test
+account, open a lead (brief appears; second open is a cache hit),
+then Draft with AI in the quote panel.
 
 ## Open items (D1, recorded honestly)
 
@@ -144,9 +228,25 @@ Not accepted in D1 (rejected as unknown until their build day):
   inventing emergency numbers would be worse than leaving the slot
   explicit. Fill `SAFETY_CARD.utilityNumbers` from official NT utility
   sources before any UI ships the card.
+  (Update 2026-10-27 D2: Power and Water emergency 1800 245 090 IS
+  in the card, verified from official sources; gas still routes to
+  000 with the gap stated explicitly.)
 - SAM 3.1 and Muse Image 1.0 model IDs were secondary-verified in
   api-readiness.md — confirm them in the live-key smoke tests before
   any feature routes to them.
+  (Update 2026-10-28: both confirmed live — SAM via streaming
+  Responses API, Image returning WebP bytes. See provider section.)
 - The route handler itself cannot be live-tested on this VM (no Firebase
   Admin credentials here — it honestly returns 401/503 without them).
   Its pure rules are covered by `tests/ai-gateway.test.mjs` (16 tests).
+- Provider usage (tokens/cost) is NOT yet plumbed into `aiUsage` —
+  the route still records 0 for tokens/estimatedCost. Wire the
+  provider's usage fields through `runAiFeature` before relying on
+  usage accounting for budget decisions.
+- Before enabling `image-preview` for real users, the route must move
+  image bytes to Storage instead of caching base64 in `aiCache`
+  (a Firestore doc); the current output shape is transport-correct
+  but storage-wasteful.
+- The `~` lossless SAM mask encoding is not decoded (see provider
+  section); if live SAM traffic returns it, masks come back null
+  with `samStatus: 'unsupported-encoding'` rather than wrong.

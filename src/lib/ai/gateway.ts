@@ -4,11 +4,12 @@
 //   - ONE server endpoint (/api/ai, see src/app/api/ai/route.ts) is the
 //     only path from the app to any model. The browser never calls a
 //     model provider directly.
-//   - MOCKS AND TEST DATA ONLY. No real API key exists yet, none is
-//     invented, and none is written into code. The mock provider below
-//     returns deterministic test shapes; a real provider plugs in
-//     later behind the same interface, and only after the
-//     data-retention / human-review terms are read.
+//   - MOCKS AND TEST DATA ONLY, unless the route selects the real
+//     provider (src/lib/ai/provider.ts) because MODEL_API_KEY is
+//     present. The real provider plugs into the same AiProvider
+//     interface behind this same allow-list, and only after the
+//     data-retention / human-review terms were read (2026-10-28).
+//     No key is ever invented or written into code.
 //   - Feature flag OFF for real users: DEFAULT_FEATURE_FLAGS are all
 //     false, and the route reads the Firestore config/ai doc (missing
 //     doc = all OFF). Nothing here can enable a feature by itself.
@@ -97,6 +98,11 @@ export const STANDARD_MODEL_ALLOWLIST: readonly string[] = [
   'muse-spark-1.1', // Fallback only.
   'sam-3.1', // Segmentation for photo-brief only.
   'muse-image-1.0', // Image-preview only.
+  // Transcription transport is NOT built yet — voice features take
+  // transcripts today, and transcription plugs in before this
+  // gateway (see prompts.ts). Listed so the allow-list matches the
+  // verified Standard-tier model set; nothing routes to it yet.
+  'muse-voice-transcribe-1.0',
 ];
 
 /** The single enforcement point: allow-listed AND never a Contributor ID. */
@@ -239,6 +245,16 @@ export function stripPiiDeep(value: unknown): unknown {
 // ---------------------------------------------------------------------------
 // Safety card (C3) — FIXED text written by us, never by a model.
 // The card never blocks posting a job.
+//
+// NOTE ON DUPLICATION (D2): these definitions are mirrored in
+// ./safety-patterns.ts for the browser, because this module imports
+// node:crypto (unimportable client-side) and Node's type stripping
+// cannot resolve the extensionless import tsc requires. The two
+// copies are kept identical by tests/ai-d2.test.mjs ("gateway and
+// browser safety copies agree") — if you change one, change the
+// other, or that test fails. Numbers verified from official NT
+// sources in D2; see safety-patterns.ts for the sources. Gas has no
+// verified NT household number, so the card routes gas smells to 000.
 // ---------------------------------------------------------------------------
 
 const DANGER_PATTERNS: readonly RegExp[] = [
@@ -246,8 +262,8 @@ const DANGER_PATTERNS: readonly RegExp[] = [
   /smell(s|ing)?\s+(of\s+)?gas/i,
   /spark(ing|ed|s)?\b/i,
   /exposed\s+wires?/i,
-  /flooding\s+near\s+(power|electric)/i,
-  /water\s+near\s+(power|electric|outlet|switchboard)/i,
+  /flooding\s+near\s+(the\s+)?(power|electric)/i,
+  /water\s+near\s+(the\s+)?(power|electric|outlet|switchboard)/i,
   /structural\s+crack/i,
   /crack(ed)?\s+(wall|ceiling|foundation)/i,
   /branch\s+(on|over)\s+(powerlines?|power\s+lines?)/i,
@@ -258,18 +274,11 @@ export function detectSafety(text: string): boolean {
   return DANGER_PATTERNS.some((re) => re.test(text));
 }
 
-/**
- * Fixed safety card. 000 is Australia's emergency number. The NT
- * gas/electricity utility emergency numbers are NOT filled in here:
- * no official NT numbers were verified in the D1 prep docs, and
- * inventing emergency numbers would be worse than leaving the slot
- * explicit. Before ANY UI ships this card, fill utilityNumbers
- * from the official NT utility sources and record the source.
- */
 export const SAFETY_CARD = {
   title: 'Safety first — if there is immediate danger, call 000.',
   body: 'Do not touch exposed wires, sparking outlets, or anything near flooding and power. Leave the area if you smell gas and do not switch lights or appliances on or off.',
-  utilityNumbers: 'NT gas/electricity emergency numbers: TO BE FILLED from official NT utility sources before UI ships (not invented in D1).',
+  utilityNumbers:
+    'Power or water fault (Power and Water, NT, 24 hours): 1800 245 090. Gas smell: leave the area and call 000 — no NT household gas emergency number has been verified from an official source.',
   blocksPosting: false,
 } as const;
 

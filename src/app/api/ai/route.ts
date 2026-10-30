@@ -18,9 +18,14 @@
 //      a fallback, never an error page — the manual form still works.
 //   5. Model call: via gateway.ts runAiFeature (PII strip before cache
 //      and model, 15s timeout, one repair retry, then fallback).
-//      D1 provider is a MOCK: no network call, no API key, no cost.
-//   6. Usage: one increment per call into aiUsage (calls, tokens,
-//      cache hits, failures, estimated cost — all 0 for the D1 mock).
+//      Provider selection lives in src/lib/ai/provider.ts:
+//      MODEL_API_KEY present = real Meta provider (Standard tier
+//      only), absent = the D1 mock. The flag check above still
+//      gates real users — provider selection alone enables nothing.
+//   6. Usage: one increment per call into aiUsage (calls, cache
+//      hits, failures). Token/cost accounting from real provider
+//      usage fields is NOT yet plumbed — estimatedCost/tokens stay 0
+//      until that lands (open item in docs/ai-gateway.md).
 //
 // Per-feature kill switch: flip one flag in config/ai and that feature
 // falls back instantly; a daily budget cap is enforced the same way
@@ -30,14 +35,16 @@
 //
 // This route NEVER touches get-quote UI, Leads, or My listing — it is
 // gateway + AI modules only. No signups, no posting, no live writes
-// outside the ai* docs listed above. No real model key is read here:
-// when the real provider lands, it plugs into gateway.ts behind the
-// Standard-tier allow-list, and this route's logic does not change.
+// outside the ai* docs listed above. The real provider reads
+// process.env.MODEL_API_KEY (never META_API_KEY) via
+// selectAiProvider(); with no key the mock provider stays, and the
+// flag check above still returns fallback for real users either way.
 
 import { NextResponse } from 'next/server';
 import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 import { z } from 'zod';
 import { getAdminDb, verifyUserRequest } from '@/lib/server-admin';
+import { selectAiProvider } from '@/lib/ai/provider';
 import {
   aiCacheKey,
   aiFallback,
@@ -102,7 +109,8 @@ async function bumpUsage(
   if (delta.calls) update[`${feature}.calls`] = FieldValue.increment(delta.calls);
   if (delta.cacheHits) update[`${feature}.cacheHits`] = FieldValue.increment(delta.cacheHits);
   if (delta.failures) update[`${feature}.failures`] = FieldValue.increment(delta.failures);
-  // Mock cost/tokens are 0; the real provider fills these from usage fields.
+  // Token/cost accounting from real provider usage fields is NOT yet
+  // plumbed (open item) — estimatedCost/tokens stay 0 for now.
   update[`${feature}.estimatedCost`] = FieldValue.increment(0);
   update[`${feature}.tokens`] = FieldValue.increment(0);
   try {
@@ -240,8 +248,15 @@ export async function POST(req: Request) {
     }
   }
 
-  // 5. Model call (D1: mock) with timeout + one repair retry, then fallback.
-  const result = await runAiFeature({ feature, input: body.input, promptVersion });
+  // 5. Model call with timeout + one repair retry, then fallback.
+  // Provider: real Meta provider when MODEL_API_KEY is present, the
+  // D1 mock otherwise. The flag check above already gated real users.
+  const result = await runAiFeature({
+    feature,
+    input: body.input,
+    promptVersion,
+    provider: selectAiProvider(process.env.MODEL_API_KEY),
+  });
   if (result.fallback || !result.output) {
     await bumpUsage(db, dateKey, feature, { failures: 1 });
     return NextResponse.json({ ...result.fallback, cacheHit: false });
