@@ -14,8 +14,11 @@
 //      (never raw input, never stripped input — the key is a hash).
 //      A cache hit costs nothing and does NOT count against the
 //      daily cap, so a hit is checked before the cap.
-//   4. Daily caps (aiUsage/{yyyy-mm-dd} per feature): over cap returns
-//      a fallback, never an error page — the manual form still works.
+//   4. Daily caps (aiUsage/{yyyy-mm-dd} per feature, counted PER
+//      USER — eval finding F1: the cap used to read the global
+//      counter, so the first 5 customers each day would have
+//      exhausted photo-brief for everyone): over cap returns a
+//      fallback, never an error page — the manual form still works.
 //   5. Model call: via gateway.ts runAiFeature (PII strip before cache
 //      and model, 15s timeout, one repair retry, then fallback).
 //      Provider selection lives in src/lib/ai/provider.ts:
@@ -55,6 +58,7 @@ import {
   FEATURE_PROMPT_VERSION,
   FEATURE_ROLES,
   isAiFeature,
+  isOverDailyCap,
   isStandardModel,
   runAiFeature,
   stripPiiDeep,
@@ -106,9 +110,17 @@ async function bumpUsage(
   dateKey: string,
   feature: AiFeature,
   delta: { calls?: number; cacheHits?: number; failures?: number },
+  uid?: string,
 ) {
   const update: Record<string, unknown> = {};
   if (delta.calls) update[`${feature}.calls`] = FieldValue.increment(delta.calls);
+  // Per-user counter (F1): rides in the SAME update, so a call still
+  // costs exactly one write. The uid becomes a field-path segment,
+  // so it is shape-checked first (Firebase uids are alphanumeric;
+  // anything else is skipped rather than risk a malformed path).
+  if (delta.calls && uid && /^[A-Za-z0-9_-]+$/.test(uid)) {
+    update[`${feature}.byUser.${uid}`] = FieldValue.increment(delta.calls);
+  }
   if (delta.cacheHits) update[`${feature}.cacheHits`] = FieldValue.increment(delta.cacheHits);
   if (delta.failures) update[`${feature}.failures`] = FieldValue.increment(delta.failures);
   // Token/cost accounting from real provider usage fields is NOT yet
@@ -189,6 +201,30 @@ export async function POST(req: Request) {
       audioSha256: createHash('sha256').update(audioDataUri, 'utf8').digest('hex'),
     };
   }
+  // Same measurement treatment for a photo payload (eval finding
+  // F2): an imageDataUri stands in by its SHA-256, not its length,
+  // so a production-size photo reaches the gateway — which refuses
+  // image input cleanly (G1) — instead of dying here on the 50k cap
+  // that exists for text. The cap still applies to everything else,
+  // the gateway still receives the untouched original input, and
+  // the payload itself is never stored. (Side benefit: the strip
+  // can no longer chew digit chains out of the base64 in this
+  // route-level copy either.)
+  if (
+    stripSource !== null &&
+    typeof stripSource === 'object' &&
+    !Array.isArray(stripSource) &&
+    typeof (stripSource as Record<string, unknown>).imageDataUri === 'string'
+  ) {
+    const record = stripSource as Record<string, unknown>;
+    const imageDataUri = record.imageDataUri as string;
+    const rest: Record<string, unknown> = { ...record };
+    delete rest.imageDataUri;
+    stripSource = {
+      ...rest,
+      imageSha256: createHash('sha256').update(imageDataUri, 'utf8').digest('hex'),
+    };
+  }
   const strippedInput = stripPiiDeep(stripSource);
   if (JSON.stringify(strippedInput).length > MAX_INPUT_JSON_CHARS) {
     return userError('Input is too large.');
@@ -258,17 +294,17 @@ export async function POST(req: Request) {
     }
   }
 
-  // 4. Daily cap — over cap = fallback, never an error page.
+  // 4. Daily cap — PER USER (F1): the decision reads this caller's
+  // own counter inside the same day doc (isOverDailyCap in
+  // gateway.ts), never the global total. Over cap = fallback,
+  // never an error page. The flag check above still runs first and
+  // the cache check still bypasses the cap — both unchanged.
   const dateKey = new Date().toISOString().slice(0, 10);
   const cap = dailyCapFor(feature, role);
   if (cap !== null) {
     try {
       const usageSnap = await db.collection('aiUsage').doc(dateKey).get();
-      const used = usageSnap.data()?.[feature];
-      const calls = used && typeof used === 'object' && typeof (used as Record<string, unknown>).calls === 'number'
-        ? ((used as Record<string, unknown>).calls as number)
-        : 0;
-      if (calls >= cap) {
+      if (isOverDailyCap(usageSnap.data()?.[feature], uid, cap)) {
         return fallbackResponse(feature, 'Daily AI limit reached — the manual form still works.', safetyCardShown);
       }
     } catch {
@@ -317,7 +353,7 @@ export async function POST(req: Request) {
       // Counter failure does not fail the response.
     }
   }
-  await bumpUsage(db, dateKey, feature, { calls: 1 });
+  await bumpUsage(db, dateKey, feature, { calls: 1 }, uid);
 
   return NextResponse.json({
     fallback: false,

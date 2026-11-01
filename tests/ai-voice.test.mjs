@@ -176,7 +176,7 @@ tests.push(() => check('voice-brief with audio: transcribe -> PII strip -> brief
     provider,
   });
   assert.equal(r.fallback, null);
-  assert.equal(r.output.trade, 'plumber');
+  assert.equal(r.output.trade, 'Plumbing'); // gateway normalises the provider's 'plumber' (eval fix, 2026-11-01)
   // The transcript the UI shows is the STRIPPED one.
   assert.equal(r.output.transcript, 'The kitchen tap is leaking badly, call me on [phone removed] when you can');
   // The brief model never saw the phone number.
@@ -269,7 +269,7 @@ tests.push(() => check('text-only voice-brief (transcript input) never calls tra
     provider,
   });
   assert.equal(r.fallback, null);
-  assert.equal(r.output.trade, 'plumber');
+  assert.equal(r.output.trade, 'Plumbing'); // gateway normalises the provider's 'plumber' (eval fix, 2026-11-01)
   assert.ok(!('transcript' in r.output), 'no transcript is attached for a text-only call');
   assert.equal(fetchStub.calls.length, 1);
 }));

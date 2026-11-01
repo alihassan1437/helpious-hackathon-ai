@@ -164,7 +164,11 @@ tests.push(() => check('JSON parse + repair path: garbage first, valid brief sec
   const provider = createMetaProvider('test-key', fetchStub);
   const r = await runAiFeature({ feature: 'photo-brief', input: { text: 'dripping tap' }, provider });
   assert.equal(r.fallback, null);
-  assert.equal(r.output.trade, 'plumber');
+  // The provider returned 'plumber'; the GATEWAY normalises brief
+  // trades to the canonical category on the way out (eval fix,
+  // 2026-11-01). The direct provider.call tests below still see the
+  // raw label — normalisation is a gateway layer, not transport.
+  assert.equal(r.output.trade, 'Plumbing');
   assert.equal(r.repairAttempted, true);
   assert.equal(fetchStub.calls.length, 2);
   const repairSystem = fetchStub.calls[1].body.messages[0].content;
@@ -192,15 +196,22 @@ tests.push(() => check('timeout: a hung provider falls back within budget', asyn
   assert.ok(Date.now() - start < 5000, `took ${Date.now() - start}ms`);
 }));
 
-// Vision + SAM integration ------------------------------------------------
-tests.push(() => check('photo-brief with photo + samPrompt returns brief + mapped mask', async () => {
+// Vision + SAM transport ----------------------------------------------------
+// These call the provider DIRECTLY, on purpose: since 2026-11-01
+// (gate G1) the gateway refuses imageDataUri inputs before any
+// provider call, so the vision/SAM transport is unreachable through
+// runAiFeature. The transport stays unit-verified here for the day
+// client-side masking ships; the gateway refusal itself is covered
+// in tests/ai-gateway.test.mjs.
+tests.push(() => check('provider transport: photo + samPrompt returns brief + mapped mask', async () => {
   const fetchStub = stubFetch(async (url) => {
     if (url.includes('/responses')) return sseResponse(LANE_4X4);
     return chatResponse(VALID_BRIEF);
   });
   const provider = createMetaProvider('test-key', fetchStub);
-  const r = await runAiFeature({
+  const out = await provider.call({
     feature: 'photo-brief',
+    model: 'muse-spark-1.3',
     input: {
       text: 'dripping tap',
       imageDataUri: 'data:image/jpeg;base64,xxxx',
@@ -208,31 +219,32 @@ tests.push(() => check('photo-brief with photo + samPrompt returns brief + mappe
       frameWidth: 1000,
       frameHeight: 500,
     },
-    provider,
+    promptVersion: 'photo-brief-v1',
+    repair: false,
   });
-  assert.equal(r.fallback, null);
-  assert.equal(r.output.trade, 'plumber');
-  assert.equal(r.output.samStatus, 'ok');
-  assert.equal(r.output.maskConfidence, 0.9);
-  approxPoints(r.output.mask.polygons[0], EXPECTED_BOX_MAPPED);
+  assert.equal(out.trade, 'plumber');
+  assert.equal(out.samStatus, 'ok');
+  assert.equal(out.maskConfidence, 0.9);
+  approxPoints(out.mask.polygons[0], EXPECTED_BOX_MAPPED);
   const visionBody = fetchStub.calls.find((c) => c.url.includes('/chat/completions')).body;
   assert.ok(Array.isArray(visionBody.messages[1].content), 'vision call sends content parts');
   assert.ok(visionBody.messages[1].content.some((p) => p.type === 'image_url'), 'vision call includes image_url');
 }));
-tests.push(() => check('photo-brief with zero-match SAM still returns a valid brief', async () => {
+tests.push(() => check('provider transport: zero-match SAM still returns a valid brief', async () => {
   const fetchStub = stubFetch(async (url) => {
     if (url.includes('/responses')) return sseResponse('');
     return chatResponse(VALID_BRIEF);
   });
   const provider = createMetaProvider('test-key', fetchStub);
-  const r = await runAiFeature({
+  const out = await provider.call({
     feature: 'photo-brief',
+    model: 'muse-spark-1.3',
     input: { text: 'tap', imageDataUri: 'data:image/jpeg;base64,xxxx', samPrompt: 'tap' },
-    provider,
+    promptVersion: 'photo-brief-v1',
+    repair: false,
   });
-  assert.equal(r.fallback, null);
-  assert.equal(r.output.samStatus, 'zero-match');
-  assert.equal(r.output.mask, null);
+  assert.equal(out.samStatus, 'zero-match');
+  assert.equal(out.mask, null);
 }));
 
 // Image -------------------------------------------------------------------
@@ -253,6 +265,38 @@ tests.push(() => check('image-preview returns WebP mime explicitly, never assume
   assert.equal(r.output.imageBytes, fakeWebp.length);
   const imageBody = fetchStub.calls[0].body;
   assert.equal(imageBody.model, 'muse-image-1.0');
+}));
+
+// Brief v2 prompts (D6 eval fix, 2026-11-01) -------------------------------
+tests.push(() => check('brief v2 prompts: versions bumped, all 22 categories named, practitioner nouns forbidden', async () => {
+  const { getPrompt } = await import('../src/lib/ai/prompts.ts');
+  const { TRADE_CATEGORIES, FEATURE_PROMPT_VERSION } = await import('../src/lib/ai/gateway.ts');
+  for (const feature of ['photo-brief', 'voice-brief']) {
+    const prompt = getPrompt(feature);
+    assert.equal(prompt.version, `${feature}-v2`);
+    assert.equal(FEATURE_PROMPT_VERSION[feature], prompt.version); // the two version records agree
+    for (const name of TRADE_CATEGORIES) {
+      assert.ok(prompt.system.includes(name), `${feature} prompt must name ${name}`);
+    }
+    assert.ok(prompt.system.includes('never a practitioner noun'), feature);
+    assert.ok(prompt.system.includes('"Unclear"'), feature); // honesty escape hatch survives
+  }
+  // Other features' versions are untouched by this fix.
+  assert.equal(getPrompt('quote-draft').version, 'quote-draft-v1');
+  assert.equal(getPrompt('paste-to-profile').version, 'paste-to-profile-v2');
+}));
+tests.push(() => check('brief v2 prompts: Darwin urgency context present (AC faults + no hot water are Urgent)', async () => {
+  const { getPrompt } = await import('../src/lib/ai/prompts.ts');
+  for (const feature of ['photo-brief', 'voice-brief']) {
+    const system = getPrompt(feature).system;
+    assert.ok(system.includes('air-conditioner'), feature);
+    assert.ok(system.includes('will not turn on'), feature); // A7
+    assert.ok(system.includes('blowing warm air'), feature); // A2
+    assert.ok(system.includes('abnormal noises'), feature); // A6
+    assert.ok(system.includes('mouldy smell'), feature); // A8
+    assert.ok(system.includes('hot water'), feature); // P4
+    assert.ok(system.includes('Urgent, not Routine'), feature);
+  }
 }));
 
 for (const t of tests) await t();

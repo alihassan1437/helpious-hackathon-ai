@@ -9,20 +9,25 @@ It is a mirror of the AI surface as it exists in the host app today
 B7 paste-to-profile and the per-feature timeout fix; the round 3
 sync, also 30 October 2026, added voice — "Describe it by voice"
 for customers and "Draft by voice" for tradies — including the
-verified transcription contract described below). Paths are
-preserved from the host app.
+verified transcription contract described below; the round 4 sync,
+1 November 2026, added the eval-driven gate fixes described in
+the round 4 note below). Paths are preserved from the host app.
 
 Contents:
 
 - `src/app/api/ai/route.ts` — the single `/api/ai` server endpoint:
   Firebase-token auth, role from the users doc (never the request
   body), per-feature flags (default OFF; a missing `config/ai` doc
-  means OFF), cache-before-cap, daily caps, per-job image cap, PII
+  means OFF), cache-before-cap, daily caps enforced PER USER
+  (round 4 — the counter was one global field before the eval
+  caught it; see the round 4 note), per-job image cap, PII
   strip before cache and model, SHA-256 cache key including
   promptVersion, per-feature timeout budget (15s default;
   paste-to-profile 60s, voice features 45s — see the timeout note
-  below), one repair retry, `{fallback: true}`. Voice calls are
-  measured against their own larger audio cap, and only a SHA-256
+  below), one repair retry, `{fallback: true}`. The input size
+  cap is measured with any image payload replaced by its SHA-256
+  stand-in rather than its base64 length (round 4, finding F2).
+  Voice calls are measured against their own larger audio cap, and only a SHA-256
   of the audio payload enters the route's cache key — recordings
   themselves are never stored.
 - `src/lib/ai/gateway.ts` — the pure gateway core: feature allow-list,
@@ -30,6 +35,12 @@ Contents:
   PII strip, fixed C3 safety card, output validation, the per-feature
   timeout budgets (`FEATURE_TIMEOUT_MS` / `timeoutForFeature`), and
   the mock provider (kept for tests and for key-less environments).
+  As of round 4 it also refuses any input carrying photo bytes
+  (an `imageDataUri`) with the standard fallback — vision input
+  stays disabled until client-side masking lands; the shipped
+  client never sent photos — and it normalises brief trade labels
+  onto the site's 22 category names deterministically
+  (`normalizeTradeLabel`; see the round 4 note).
 - `src/lib/ai/provider.ts` — the REAL Meta Model API provider
   (added 28 October 2026): Spark chat + vision via
   `/v1/chat/completions`, SAM 3.1 segmentation via the streaming
@@ -50,7 +61,11 @@ Contents:
 - `src/lib/ai/prompts.ts` — versioned prompt library (including the
   paste-to-profile v2 contract: a fixed field set, each field
   carrying the exact snippet from the business's own paste that
-  supports it).
+  supports it; and, as of round 4, photo-brief / voice-brief v2:
+  the trade value must be EXACTLY one of the 22 Helpious category
+  names, and the urgency guidance carries Darwin context — a dead
+  air-conditioner in the build-up / wet season is Urgent, not
+  Routine).
 - Timeout note: the first live flag-on proof of paste-to-profile
   fell back even though the model's reply validated perfectly —
   a full extraction plus SEO copy measured 23.7s against the flat
@@ -156,14 +171,94 @@ Contents:
   reaches the brief/quote model — a spoken phone number arrives at
   the model only as `[phone removed]`. The cache stores only the
   stripped transcript, never the audio.
+- Round 4 note — eval-driven gate fixes (1 November 2026): on
+  1 November the full 112-case evaluation from the prep dayplan
+  (100 Snap-to-Quote cases + 12 adversarial) was run live against
+  the deployed gateway, alongside an audit of the 12 privacy
+  gates. The privacy and honesty results were clean — JSON
+  validity 112/112, PII leaks 0, invented details 0, urgency
+  85/100 (at its threshold), cache behaviour and the kill-switch
+  drill passed — but three things failed, and this sync is the
+  fix for each:
+  - Safety-card recall was 4/6 live. The fixed card fired on
+    P5 (gas smell), E1 (scorch marks / sparked), E5 (exposed
+    wires) and P3 (flooding), but missed G3 — "Large branch
+    hanging over a roof near powerlines", because the old pattern
+    demanded the branch be IMMEDIATELY against the powerlines —
+    and G7 — "Palm fronds touching overhead wires", because no
+    vegetation-near-wires pattern existed at all. The pre-run
+    gates audit had flagged the same class of gap in other
+    phrasings: the missing article ("flooding near a power
+    point"), water near power without adjacency, and "gas leak
+    smell". The patterns in BOTH copies (`gateway.ts` +
+    `safety-patterns.ts`, kept in agreement by a test) were
+    widened for all of these; a powerline/wire target is still
+    required, so ordinary garden text does not fire the card.
+  - PII strip gaps (gates audit G2, bait-tested against the real
+    strip function): dot-separated and mixed-separator phone
+    numbers (`0412.345.678`) reached the model verbatim; street
+    suffixes outside the original list — Boulevard, Esplanade,
+    Terrace, Crescent, Close, Circuit, Way, Grove, plus
+    suffix-less addresses like "12 Smith, Darwin" — were missed;
+    spelled-out emails ("john at gmail dot com") were missed.
+    All three classes are now stripped. The same audit found an
+    over-strip bug in the opposite direction: "I am in
+    Casuarina" was eaten by the name-introduction pattern,
+    deleting the suburb a brief is allowed to carry — the
+    pattern now requires a capitalised name, so suburbs survive.
+  - Photo bytes are now REFUSED by the gateway (gate G1): any
+    input carrying an `imageDataUri` gets the standard fallback
+    and the provider is never called, until client-side masking
+    (faces / number plates) lands. Vision input was reachable
+    only via the raw API — the shipped C1 client sends text
+    only, never photos — so this closes the hole without
+    changing shipped behaviour.
+  - Trade vocabulary: strict trade accuracy was 26/100 while
+    semantic routing (the right trade family under any label)
+    was 89/100 — 63 of the 74 strict misses were the right trade
+    in the wrong label form ("Plumber" instead of "Plumbing",
+    "Bond Cleaning", "Web Developer"), because prompt v1 said
+    "return trade/category" without constraining the value. Two
+    layers fix it: the brief prompts are now v2 and require
+    EXACTLY one of the 22 Helpious category names, and the
+    gateway deterministically normalises known variant labels
+    onto the canonical names after a brief validates
+    (`normalizeTradeLabel`). The alias table is evidence-based —
+    every entry is a label the eval actually returned — and a
+    label with no unambiguous canonical home is left exactly as
+    the model returned it rather than silently forced. Because
+    normalisation happens inside the gateway, the route caches
+    the canonical form too.
+  - Darwin urgency context: the v2 brief prompts now state that
+    in Darwin's build-up and wet season a household
+    air-conditioner that is not cooling (or a failed hot water
+    system) is Urgent, not Routine — the v1 prompt had no local
+    context and under-called those cases.
+  - Finding F1 — daily caps were GLOBAL, not per user: the cap
+    counter was a single field on the daily usage doc, so the
+    first 5 customers each day would have exhausted the
+    photo-brief cap for everyone (the eval itself had to run
+    most cases in the business role for exactly this reason).
+    The route now keeps a per-user counter in the same single
+    write and enforces the cap per user.
+  - Finding F2 — the route's 50,000-char input cap was smaller
+    than the browser image pipeline's own output (a 1024px JPEG
+    is ~80k+ base64 chars), so a production-size photo payload
+    could never have passed the route at all. Input is now
+    measured with any image payload replaced by its SHA-256
+    stand-in (the payload itself is still refused, per G1).
+  A full 112-case re-run against the fixed build is in progress;
+  its results will be recorded here when it completes. Until
+  then the honest status is: fixes built, unit-tested and
+  deployed; eval re-run pending.
 - Tests (no network, no real key; provider tests use an injected
-  stub fetch) — six suites, 83 tests:
-  - `tests/ai-gateway.test.mjs` — 17 tests, `node tests/ai-gateway.test.mjs`
-  - `tests/ai-d2.test.mjs` — 6 tests, `node tests/ai-d2.test.mjs`
+  stub fetch) — six suites, 102 tests:
+  - `tests/ai-gateway.test.mjs` — 32 tests, `node tests/ai-gateway.test.mjs`
+  - `tests/ai-d2.test.mjs` — 8 tests, `node tests/ai-d2.test.mjs`
   - `tests/ai-b1b2.test.mjs` — 14 tests, `node tests/ai-b1b2.test.mjs`
   - `tests/ai-b7.test.mjs` — 14 tests,
     `node --import ./tests/register.mjs tests/ai-b7.test.mjs`
-  - `tests/ai-provider.test.mjs` — 16 tests,
+  - `tests/ai-provider.test.mjs` — 18 tests,
     `node --import ./tests/register.mjs tests/ai-provider.test.mjs`
     (`tests/register.mjs` + `tests/ts-resolve-loader.mjs` are the
     small Node loader that resolves the sources' extensionless

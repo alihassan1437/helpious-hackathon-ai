@@ -23,8 +23,21 @@ ships to the browser.
   mirror the gateway's output shapes; a reply that fails validation
   throws so the gateway retries with a repair instruction.
 - Vision: the same endpoint with `image_url` data URIs (JPEG from
-  the browser pipeline, 1024px max). The caller supplies
-  `imageDataUri` in the input; without it the call is text-only.
+  the browser pipeline, 1024px max). **DISABLED AT THE GATEWAY
+  since 2026-11-01 (gate G1):** `runAiFeature` refuses any input
+  carrying an `imageDataUri` — standard fallback, provider never
+  called — because client-side masking (resize + EXIF strip +
+  face / plate / house-number blur) is not wired end-to-end yet,
+  and the provider would otherwise forward the photo unprocessed
+  (this one gateway check also covers the SAM path below, which is
+  only reached through provider calls carrying an image). The
+  2026-10-28 vision smoke test was a direct API call with a test
+  photo; it remains true about the API, but it is NOT wired to
+  user photos. The shipped C1 client sends text + `hasPhoto` only.
+  Re-enable vision input only when client-side masking ships; the
+  provider code path is retained, unreachable, for that day. The
+  image-preview feature is unaffected — it GENERATES an image
+  from a text prompt; its `imageDataUri` is output, never input.
 - SAM: `POST /v1/responses`, model `sam-3.1`, `stream: true`,
   metadata `mask_encoding: one_bit` + `include_confidence: true`.
   STREAMING IS MANDATORY — the non-streaming call returns an empty
@@ -38,7 +51,9 @@ ships to the browser.
   never fails the brief — the brief is valid without a mask.
   The `~` lossless mask encoding is NOT decoded (its byte layout is
   not documented well enough to decode honestly) and yields
-  `samStatus: 'unsupported-encoding'`, not a mask.
+  `samStatus: 'unsupported-encoding'`, not a mask. Like vision,
+  SAM is unreachable through the gateway while image input is
+  disabled (G1, above).
 - Image: `POST /v1/images/generations`, model `muse-image-1.0`,
   1024x1024. The API returns JSON with `data[0].b64_json` whose
   bytes are WEBP, not JPEG — the mime is sniffed from the bytes and
@@ -86,8 +101,10 @@ Content-Type: application/json
 
 - `feature` — one of the D1 features below. Anything else is rejected
   (`400 Unknown AI feature`).
-- `input` — the feature's payload (text and/or image references). Images
-  must already be resized/compressed by the browser (max 1024px, ~150 KB).
+- `input` — the feature's payload (text). An `imageDataUri` in the
+  input is refused at the gateway with the standard fallback until
+  client-side photo masking ships (G1, 2026-11-01 — see the Vision
+  bullet above); the shipped client sends text + `hasPhoto` only.
   Voice features accept a `transcript` string (text-only) OR a
   recording as `audioDataUri` (`data:audio/...;base64,...`, max
   4 MB of audio); with audio, the provider transcribes first and
@@ -125,7 +142,7 @@ by a model, and never blocks posting a job.
 
 | Feature | Side | Model (prod) | Daily cap |
 |---|---|---|---|
-| `photo-brief` | C1/B1 Snap-to-Quote brief | Spark 1.3 (+ SAM 3.1 segmentation) | 5/day per customer |
+| `photo-brief` | C1/B1 Snap-to-Quote brief | Spark 1.3 (SAM 3.1 segmentation built, unreachable while vision input is disabled — G1) | 5/day per customer |
 | `quote-draft` | B2 quote draft, business's own prices only | Spark 1.3 | 30/day per business |
 | `paste-to-profile` | B7 paste text → listing fields | Spark 1.3 | 5/day per business, 50/day per admin |
 | `voice-brief` | Voice on get-quote → brief | Spark 1.3 | 5/day per customer |
@@ -150,15 +167,46 @@ Not accepted in D1 (rejected as unknown until their build day):
   caller outside the role gets a fallback, not an error.
 - Over-cap requests return a fallback. Cache hits bypass the daily cap
   (they cost nothing) and are counted separately in usage.
+- **Caps are PER USER** (eval finding F1, fixed 2026-11-01). The cap
+  values in the table were always written per user ("5/day per
+  customer"), but the first implementation compared them against the
+  GLOBAL `{feature}.calls` counter — the first 5 customers each UTC
+  day would have exhausted `photo-brief` for everyone. The decision
+  now reads the caller's own counter, `{feature}.byUser.{uid}`,
+  inside the same `aiUsage/{yyyy-mm-dd}` doc (the pure decision is
+  `isOverDailyCap` in gateway.ts), and the counting write increments
+  both counters in the same update — still exactly 1 read + 1 write
+  per call. The global counter remains for budget totals. Usage docs
+  written before the fix have no `byUser` map, so per-user counts
+  start at 0 from deploy (caps reset at UTC midnight anyway).
+  Tradeoff, recorded honestly: all counters share one day doc with
+  Firestore's 1 MB document ceiling — at ~50 bytes per (feature,
+  user) entry that is tens of thousands of distinct daily users
+  before it matters, far beyond current scale; the counters can
+  move to per-user day docs later at the same 1-read/1-write cost.
+- **Input size**: the route's 50k-char cap (`MAX_INPUT_JSON_CHARS`)
+  is a backstop for TEXT. Opaque payloads are measured by stand-in,
+  never by length: a voice recording against its own 6M-char cap
+  (Voice section), and — since 2026-11-01, eval finding F2 — an
+  `imageDataUri` by its SHA-256. An oversized photo therefore
+  reaches the gateway's clean G1 refusal instead of dying at the
+  route; the 50k cap still applies to everything else in the input.
 
 ## PII strip, cache, usage, kill switch
 
 - **PII strip** runs before cache lookup and before any model call:
-  emails, AU mobiles/landlines (+61), street number + street name, long
-  digit chains, and narrow "my name is X" patterns are removed. Suburb
-  text is kept. Arbitrary person names cannot be detected by pattern —
-  callers must never send names. If stripping leaves nothing usable, the
-  gateway falls back instead of calling with raw input.
+  emails (including the spelled-out "x at y dot com" form), AU
+  mobiles/landlines (+61; space, hyphen and dot separators, mixed),
+  street number + street name (suffix list includes Boulevard,
+  Esplanade, Terrace, Crescent, Close, Way, Circuit, Grove; the
+  suffix-less "12 Smith, Darwin" shape loses its street fragment
+  but keeps the suburb), long digit chains, and narrow "my name
+  is X" patterns are removed. Suburb text is kept — including after
+  "I am in …", which an earlier case-insensitive name pattern
+  wrongly ate (fixed 2026-11-01, gate G2). Arbitrary person names
+  cannot be detected by pattern — callers must never send names.
+  If stripping leaves nothing usable, the gateway falls back
+  instead of calling with raw input.
 - **Cache**: `aiCache/{sha256(feature + model + stripped input +
   promptVersion)}`, 30-day TTL, holding the validated output only.
   Never raw input, never stripped input — the key is a hash.
@@ -170,6 +218,43 @@ Not accepted in D1 (rejected as unknown until their build day):
   instantly; it then falls back quietly.
 - **Image-preview counter**: `aiImagePreview/{jobId}` holds a count only
   (no photo, no input, no PII), capped at 2 per job.
+
+## Trade vocabulary (brief features)
+
+A brief's `trade` is one of the site's 22 category names
+(`TRADE_CATEGORIES` in gateway.ts) — the same names customers pick
+in get-quote. The D6 eval scored trade by exact match and got
+26/100 while the underlying routing was 89/100 right: the model
+returned practitioner nouns and sub-specialties ("Plumber",
+"Bond Cleaning", "Web Developer") because v1 constrained nothing.
+Two layers fix it (2026-11-01):
+
+1. **Prompt (v2)**: `photo-brief-v2` / `voice-brief-v2` enumerate
+   the canonical list (built from `TRADE_CATEGORIES`, so the prompt
+   and the code cannot drift), forbid practitioner nouns and
+   sub-specialties, and keep the "Unclear" escape hatch for inputs
+   with no trade job — the honesty cases depend on it. The v2
+   prompts also carry Darwin urgency context from the dayplan's
+   own expected values: a household air-conditioner that is not
+   cooling, will not turn on, is making abnormal noises or blows a
+   mouldy smell is Urgent (build-up/wet-season heat), and a failed
+   hot water system is Urgent. Version bumps invalidate v1 cache
+   entries by construction.
+2. **Deterministic normalisation**: `normalizeTradeLabel` runs in
+   `runAiFeature` on every validated brief output (both brief
+   features share that return path, and the route caches what it
+   returns, so cached briefs are canonical too). Known variant
+   labels map to their category — every alias is a label the eval
+   actually returned whose case expected that category, plus the
+   standard practitioner nouns. Labels with no unambiguous home
+   are left EXACTLY as returned, never forced: "Arborist"
+   (Gardening vs Tree Removal), "Tiler" (its one eval job is
+   Handyman-scored re-siliconing), "Rubbish Removal" (no category),
+   the compound "Plumbing and Tiling", and the honesty labels
+   "Unclear"/"Unknown". Labels that are themselves canonical —
+   including "Appliance Repair" and "Fencing", whose dayplan
+   expectations predate those categories — are never rewritten
+   into another category.
 - **No rules change**: `aiCache`, `aiUsage`, `config/ai`, and
   `aiImagePreview` have no client match (default deny); all access is
   through the Admin SDK route.

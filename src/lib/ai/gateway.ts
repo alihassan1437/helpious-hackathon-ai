@@ -132,10 +132,10 @@ export const FEATURE_MODEL: Record<AiFeature, string> = {
 // ---------------------------------------------------------------------------
 
 export const FEATURE_PROMPT_VERSION: Record<AiFeature, string> = {
-  'photo-brief': 'photo-brief-v1',
+  'photo-brief': 'photo-brief-v2',
   'quote-draft': 'quote-draft-v1',
   'paste-to-profile': 'paste-to-profile-v2',
-  'voice-brief': 'voice-brief-v1',
+  'voice-brief': 'voice-brief-v2',
   'voice-quote': 'voice-quote-v1',
   'safety-check': 'safety-check-v1',
   comparison: 'comparison-v1',
@@ -184,6 +184,198 @@ export function dailyCapFor(feature: AiFeature, role: AiRole): number | null {
   return typeof cap === 'number' ? cap : null;
 }
 
+// ---------------------------------------------------------------------------
+// Per-user daily-cap accounting (eval finding F1, 2026-11-01)
+//
+// FEATURE_DAILY_CAPS values are PER USER ("customers 5 photo briefs/day"
+// in the dayplan means each customer). The counters live inside the
+// same aiUsage/{yyyy-mm-dd} doc the route already reads and writes —
+// `{feature}.byUser.{uid}` next to the global `{feature}.calls` — so a
+// call still costs exactly 1 read + 1 write. The global `calls`
+// counter is kept for budget totals and the kill-switch drill; it no
+// longer decides anyone's cap. Usage docs written before this change
+// have no byUser map: per-user counts simply start at 0 from deploy
+// (nobody loses allowance they had; the caps reset at UTC midnight
+// anyway). Tradeoff, recorded honestly: one shared day doc has a 1 MB
+// Firestore ceiling — at ~50 bytes per (feature, user) counter that
+// is tens of thousands of distinct users per day before it matters,
+// far beyond current scale; if it ever approaches, the counters move
+// to per-user day docs at the same 1-read/1-write cost.
+// ---------------------------------------------------------------------------
+
+/** This user's counted calls for one feature today, defensively read. */
+export function userDailyCalls(featureUsage: unknown, uid: string): number {
+  if (!isRecord(featureUsage)) return 0;
+  const byUser = featureUsage.byUser;
+  if (!isRecord(byUser)) return 0;
+  const n = byUser[uid];
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/** The cap decision: per-user count vs the (unchanged) cap value. */
+export function isOverDailyCap(featureUsage: unknown, uid: string, cap: number | null): boolean {
+  if (cap === null) return false;
+  return userDailyCalls(featureUsage, uid) >= cap;
+}
+
+// ---------------------------------------------------------------------------
+// Trade vocabulary (D6 eval fix, 2026-11-01)
+//
+// The eval scored trade by exact match to the site category name and
+// got 26/100: the model understood the jobs (semantic routing was
+// 89/100) but returned practitioner nouns and sub-specialty labels —
+// "Plumber", "Bond Cleaning", "Web Developer" — because nothing
+// constrained the vocabulary. Two layers fix it: the v2 brief prompts
+// enumerate the canonical list (prompts.ts), and this deterministic
+// normalisation maps known variant labels onto it after a brief
+// output validates. It runs here, in runAiFeature, because BOTH
+// brief features (photo-brief and voice-brief) pass through this one
+// return path — and the route caches what runAiFeature returns, so
+// cached briefs are canonical too.
+//
+// The alias table is EVIDENCE-BASED: every entry is a label the
+// 2026-11-01 eval actually returned (results.jsonl) whose case
+// expected the canonical name, plus the obvious practitioner nouns.
+// A label with no unambiguous canonical home is left EXACTLY as the
+// model returned it — a wrong-looking label is honest; a silently
+// forced wrong category is not. Canonical names pass through
+// unchanged, including labels that are themselves canonical (the
+// normaliser never rewrites one category into another).
+// ---------------------------------------------------------------------------
+
+/** The site's category names, exactly as spelled (22). */
+export const TRADE_CATEGORIES = [
+  'Plumbing',
+  'Electrical',
+  'Painting',
+  'Cleaning',
+  'Gardening & Lawn Care',
+  'Air Conditioning',
+  'Pest Control',
+  'Handyman',
+  'Car Mechanic',
+  'Website Development',
+  'Locksmith',
+  'Roofing',
+  'Removalists',
+  'Appliance Repair',
+  'Fencing',
+  'Tiling',
+  'Solar Installation',
+  'Pool Cleaning',
+  'Tree Removal',
+  'Security Systems',
+  'Concreting',
+  'Flooring',
+] as const;
+
+/**
+ * Variant label → canonical category. Keys are matched case-
+ * insensitively with whitespace collapsed and dashes normalised.
+ * Each group cites its eval evidence (case IDs from the 2026-11-01
+ * run); see tests/ai-gateway.test.mjs for the full per-case table
+ * and the intentionally-unmapped list.
+ */
+const TRADE_LABEL_ALIASES: Record<string, string> = {
+  // Plumbing — "Plumber" ×7 (P1–P4, P7–P9, X9), "Gasfitter" ×2
+  // (P5, P10; in AU practice gasfitting is a plumbing licence class
+  // and the dayplan expects Plumbing for both cases).
+  plumber: 'Plumbing',
+  gasfitter: 'Plumbing',
+  'gas fitter': 'Plumbing',
+  // Electrical — "Electrician" ×9 (E1–E6, E8–E10).
+  electrician: 'Electrical',
+  // Painting — "Painter" ×9 (PA1, PA2, PA4–PA10), "Roof Painting" (PA3).
+  painter: 'Painting',
+  'roof painting': 'Painting',
+  // Cleaning — sub-specialty labels, one case each (CL1–CL7).
+  cleaner: 'Cleaning',
+  'bond cleaning': 'Cleaning',
+  'house cleaning': 'Cleaning',
+  'carpet cleaning': 'Cleaning',
+  'commercial cleaning': 'Cleaning',
+  'oven cleaning': 'Cleaning',
+  'pressure cleaning': 'Cleaning',
+  'window cleaning': 'Cleaning',
+  // Gardening & Lawn Care — "Gardener" ×3 (G2, G6, G9), "Lawn Mowing"
+  // ×2 (G1, G10), "Lawn Care" (G8), "Irrigation" (G5); the bare short
+  // form "Gardening" canonicalises to the full category name.
+  gardener: 'Gardening & Lawn Care',
+  gardening: 'Gardening & Lawn Care',
+  'lawn mowing': 'Gardening & Lawn Care',
+  'lawn care': 'Gardening & Lawn Care',
+  irrigation: 'Gardening & Lawn Care',
+  // Car Mechanic — "Mechanic" ×6 (C1, C2, C5, C7, C8, C10),
+  // "Mechanic - Transmission" (C6), "Tyre Service" (C4), "Tyres"
+  // (C9), "Auto Air Conditioning" (C3 — car AC is Car Mechanic in
+  // the dayplan, distinct from household Air Conditioning).
+  mechanic: 'Car Mechanic',
+  'mechanic - transmission': 'Car Mechanic',
+  'tyre service': 'Car Mechanic',
+  tyres: 'Car Mechanic',
+  'auto air conditioning': 'Car Mechanic',
+  // Website Development — "Web Developer" ×4 (W2, W5, W6, W8),
+  // "Web Design" ×3 (W1, W3, W4), "Web Designer" (W10),
+  // "Web Development" (W7), "SEO Specialist" (W9 — the dayplan
+  // expects Website Development; there is no SEO category).
+  'web developer': 'Website Development',
+  'web design': 'Website Development',
+  'web designer': 'Website Development',
+  'web development': 'Website Development',
+  'seo specialist': 'Website Development',
+  // Handyman — sub-specialty labels with no category of their own;
+  // the dayplan expects Handyman for each: "Carpenter" ×2 (H2 door
+  // hinge, H4 decking), "Plasterer" (H3), "Furniture Assembly" (H1),
+  // "TV Mounting" (H8), "Window Repairs" (H6).
+  carpenter: 'Handyman',
+  plasterer: 'Handyman',
+  'furniture assembly': 'Handyman',
+  'tv mounting': 'Handyman',
+  'window repairs': 'Handyman',
+};
+
+/**
+ * Labels deliberately NOT mapped — returned unchanged:
+ * - "Arborist" (G3, G7): the dayplan expects Gardening, but the site
+ *   taxonomy also has Tree Removal — two defensible homes, so the
+ *   meaning is NOT unambiguous and no deterministic map is honest.
+ *   The v2 prompt lets the model choose from the canonical list.
+ * - "Tiler" (H9): the only eval occurrence is shower re-silicone,
+ *   which the dayplan scores as Handyman; re-siliconing is not
+ *   tiling, so neither Tiling nor Handyman is an honest blanket map.
+ * - "Appliance Repair" (E7) and "Fencing" (H7): both are canonical
+ *   categories in their own right. Their eval expectations
+ *   (Electrical, Handyman) come from the dayplan's original
+ *   10-category set; rewriting one valid category into another
+ *   would corrupt genuine briefs for those trades.
+ * - "Rubbish Removal" (G4): no canonical home — Removalists is
+ *   household moving, not waste removal.
+ * - "Plumbing and Tiling" (X10): a compound label for a genuine
+ *   two-trade job; no single canonical home.
+ * - "Unclear" / "Unknown" / "Unknown - Bathroom" (X5–X7): the
+ *   model's honest "cannot tell" answers. Those cases PASS because
+ *   no trade is forced; mapping them would break that behaviour.
+ */
+export function normalizeTradeLabel(label: string): string {
+  const trimmed = label.trim().replace(/\s+/g, ' ');
+  const key = trimmed.replace(/[–—]/g, '-').toLowerCase();
+  for (const category of TRADE_CATEGORIES) {
+    if (category.toLowerCase() === key) return category;
+  }
+  return TRADE_LABEL_ALIASES[key] ?? trimmed;
+}
+
+/** Applies normalizeTradeLabel to a validated brief output, if any. */
+function normalizeBriefTrade(
+  feature: AiFeature,
+  output: Record<string, unknown>,
+): Record<string, unknown> {
+  if (feature !== 'photo-brief' && feature !== 'voice-brief') return output;
+  if (typeof output.trade !== 'string') return output;
+  const trade = normalizeTradeLabel(output.trade);
+  return trade === output.trade ? output : { ...output, trade };
+}
+
 /** Roles allowed to call each feature. The route takes role from the token, never the body. */
 export const FEATURE_ROLES: Record<AiFeature, readonly AiRole[]> = {
   'photo-brief': ['customer', 'business', 'admin'],
@@ -202,17 +394,48 @@ export const FEATURE_ROLES: Record<AiFeature, readonly AiRole[]> = {
 // ---------------------------------------------------------------------------
 
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+// Spelled-out email ("john at gmail dot com") — that written-out
+// shape only occurs when someone is dictating an address, so it is
+// safe to strip. Stopword guard keeps prose like "look at the dot
+// com bubble" intact. (G2 audit miss, 2026-11-01.)
+const SPOKEN_EMAIL_RE =
+  /\b[A-Za-z0-9._%+-]+\s+at\s+(?!the\s+dot\b|a\s+dot\b|an\s+dot\b)[A-Za-z0-9-]+\s+dot\s+(?:com\.au|net\.au|org\.au|com|net|org|io|au)\b/gi;
 // Street number + street name ("12 Smith Street", "4/12 Smith St").
+// Suffix list widened 2026-11-01 (G2 audit): Boulevard, Esplanade,
+// Terrace, Crescent, Close, Way, Circuit and Grove previously leaked
+// verbatim (e.g. "3/45 Charles Darwin Boulevard", "12 The Esplanade").
 const STREET_RE =
-  /\b\d{1,5}(?:\/\d{1,5})?\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2}\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Lane|Ln|Place|Pl|Parade|Pde|Highway|Hwy)\b/gi;
+  /\b\d{1,5}(?:\/\d{1,5})?\s+[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2}\s+(?:Street|St|Road|Rd|Avenue|Ave|Drive|Dr|Court|Ct|Lane|Ln|Place|Pl|Parade|Pde|Highway|Hwy|Boulevard|Blvd|Esplanade|Esp|Terrace|Tce|Crescent|Cres|Close|Cl|Way|Circuit|Cct|Grove|Gr)\b/gi;
+// Suffix-less address shape: "12 Smith, Darwin" — house number +
+// single Capitalised word + comma + Capitalised place name. Kept
+// deliberately narrow and case-sensitive (capitalisation IS the
+// signal); ordinary mid-sentence prose rarely has this exact shape,
+// and an address fragment is exactly what must not reach a model.
+// Only the number + street-name fragment is removed — the place
+// name after the comma is re-emitted, because suburb-level location
+// is data the briefs are allowed to carry.
+const STREET_NO_SUFFIX_RE = /\b\d{1,5}(?:\/\d{1,5})?\s+[A-Z][A-Za-z]{2,},\s+([A-Z][A-Za-z]{2,})\b/g;
 // AU mobiles (+61 4xx / 04xx) and landlines (+61 2/3/7/8 / 0x).
-const AU_PHONE_RE = /(?:\+61\s?|0)(?:4\d{2}|[2378]\d)[\s-]?\d{3}[\s-]?\d{3}\b/g;
-// Any remaining long digit chain (account numbers, IDs, etc.).
-const DIGIT_CHAIN_RE = /\b\d[\d\s-]{6,}\d\b/g;
-// Narrow, honest name pattern only ("my name is X", "I'm X"). Arbitrary
-// person names CANNOT be detected by pattern — callers must never send
-// names, and this limitation is stated, not papered over.
-const NAME_INTRO_RE = /\b(?:my name is|i am|i'm)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?/gi;
+// Separators may be spaces, hyphens or DOTS, mixed within one number
+// ("0412.345.678", "0412 345-678") — dot-separated mobiles leaked
+// verbatim before 2026-11-01 (G2 audit). The digit-chain pattern
+// below is the backstop for shapes this one misses.
+const AU_PHONE_RE = /(?:\+61[\s.-]?|0)(?:4\d{2}|[2378]\d)[\s.-]?\d{3}[\s.-]?\d{3}\b/g;
+// Any remaining long digit chain (account numbers, IDs, etc.):
+// 8+ digits with spaces, hyphens or dots between them. Written as
+// digit (separator* digit){7,} so a separator is consumed only when
+// a digit follows — trailing sentence punctuation is never eaten
+// and short decimals ("1200.50") stay untouched.
+const DIGIT_CHAIN_RE = /\b\d(?:[\s.-]*\d){7,}\b/g;
+// Narrow, honest name pattern only ("my name is X", "I'm X"). The
+// intro is matched case-insensitively via character classes, but
+// the NAME must be genuinely Capitalised: a fully case-insensitive
+// version also matched "I am in Casuarina" (intro + "in" + suburb)
+// and deleted the suburb, which briefs are allowed to carry (G2
+// audit over-strip, 2026-11-01). Arbitrary person names still
+// CANNOT be detected by pattern — callers must never send names,
+// and this limitation is stated, not papered over.
+const NAME_INTRO_RE = /\b(?:[Mm]y name is|[Ii] am|[Ii]'m)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?/g;
 
 export interface StripResult {
   cleaned: string;
@@ -223,7 +446,12 @@ export function stripPii(text: string): StripResult {
   let cleaned = text;
   const before = cleaned;
   cleaned = cleaned.replace(EMAIL_RE, '[email removed]');
+  cleaned = cleaned.replace(SPOKEN_EMAIL_RE, '[email removed]');
   cleaned = cleaned.replace(STREET_RE, '[address removed]');
+  cleaned = cleaned.replace(
+    STREET_NO_SUFFIX_RE,
+    (_match, place: string) => `[address removed], ${place}`,
+  );
   cleaned = cleaned.replace(AU_PHONE_RE, '[phone removed]');
   cleaned = cleaned.replace(DIGIT_CHAIN_RE, '[number removed]');
   cleaned = cleaned.replace(NAME_INTRO_RE, 'the customer');
@@ -260,14 +488,28 @@ export function stripPiiDeep(value: unknown): unknown {
 
 const DANGER_PATTERNS: readonly RegExp[] = [
   /gas\s+smell/i,
+  /gas\s+leak/i,
+  /leak(ing|ed)?\s+gas\b/i,
   /smell(s|ing)?\s+(of\s+)?gas/i,
   /spark(ing|ed|s)?\b/i,
   /exposed\s+wires?/i,
-  /flooding\s+near\s+(the\s+)?(power|electric)/i,
-  /water\s+near\s+(the\s+)?(power|electric|outlet|switchboard)/i,
+  // Water/flooding near power: ordinary words may sit between the
+  // water word and "near (a|the) power…" — "flooding near a power
+  // point" (eval P3), "water pooling under the sink near a power
+  // point". The gap is length-capped and cannot cross a sentence
+  // boundary, and a target word (power/electric/outlet/switchboard)
+  // is still required, so "burst pipe in the laundry" and "water
+  // the garden" do NOT fire.
+  /\b(?:flooding|flood|water|leak|burst)\b[^.!?]{0,60}?\bnear\s+(?:a\s+|an\s+|the\s+)?(?:power|electric|outlet|switchboard)/i,
   /structural\s+crack/i,
   /crack(ed)?\s+(wall|ceiling|foundation)/i,
-  /branch\s+(on|over)\s+(powerlines?|power\s+lines?)/i,
+  // Vegetation near powerlines/wires, intervening words allowed:
+  // "branch hanging over a roof near powerlines" (eval G3), "branch
+  // on the powerlines", "palm fronds touching overhead wires"
+  // (eval G7), "fronds near powerlines". A powerline/wire target is
+  // required, so "branch near the fence" does NOT fire.
+  /\b(?:branch|branches|frond|fronds|limb|limbs|tree)\b[^.!?]{0,60}?\b(?:powerlines?|power\s+lines?)\b/i,
+  /\b(?:branch|branches|frond|fronds)\b[^.!?]{0,40}?\b(?:overhead\s+)?wires?\b/i,
   /powerlines?\s+(down|hanging)/i,
 ];
 
@@ -602,6 +844,40 @@ export async function runAiFeature(args: {
     };
   }
 
+  // G1 gate (2026-11-01): user photos are NOT forwarded to any
+  // model. Client-side masking (resize + EXIF strip + face / plate /
+  // house-number blur) is not wired end-to-end yet — the shipped C1
+  // client sends text + hasPhoto only — so until masking lands, an
+  // input carrying an `imageDataUri` gets the standard fallback and
+  // the provider is NEVER called. This one check covers every
+  // provider path that reads the field, because they are all behind
+  // provider.call: the chat vision attachment AND the SAM 3.1
+  // segmentation call (reached only from photo-brief inputs with an
+  // image + samPrompt). The check matches the provider's own read
+  // shape exactly (top-level `imageDataUri` string on a record).
+  // The image-preview feature is exempt: it GENERATES an image from
+  // a text prompt — its imageDataUri is output, never input.
+  if (
+    feature !== 'image-preview' &&
+    isRecord(args.input) &&
+    typeof args.input.imageDataUri === 'string'
+  ) {
+    return {
+      output: null,
+      fallback: aiFallback(
+        feature,
+        'Photo analysis is not switched on yet — describe the problem in words and the brief will work from your description.',
+        safetyCardShown,
+      ),
+      cacheKey,
+      model,
+      promptVersion,
+      strippedInput,
+      safetyCardShown,
+      repairAttempted: false,
+    };
+  }
+
   let repairAttempted = false;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -611,7 +887,7 @@ export async function runAiFeature(args: {
       );
       if (isValidAiOutput(feature, raw)) {
         return {
-          output: raw as Record<string, unknown>,
+          output: normalizeBriefTrade(feature, raw as Record<string, unknown>),
           fallback: null,
           cacheKey,
           model,

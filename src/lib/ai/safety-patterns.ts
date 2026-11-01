@@ -28,14 +28,28 @@
 
 export const DANGER_PATTERNS: readonly RegExp[] = [
   /gas\s+smell/i,
+  /gas\s+leak/i,
+  /leak(ing|ed)?\s+gas\b/i,
   /smell(s|ing)?\s+(of\s+)?gas/i,
   /spark(ing|ed|s)?\b/i,
   /exposed\s+wires?/i,
-  /flooding\s+near\s+(the\s+)?(power|electric)/i,
-  /water\s+near\s+(the\s+)?(power|electric|outlet|switchboard)/i,
+  // Water/flooding near power: ordinary words may sit between the
+  // water word and "near (a|the) power…" — "flooding near a power
+  // point" (eval P3), "water pooling under the sink near a power
+  // point". The gap is length-capped and cannot cross a sentence
+  // boundary, and a target word (power/electric/outlet/switchboard)
+  // is still required, so "burst pipe in the laundry" and "water
+  // the garden" do NOT fire.
+  /\b(?:flooding|flood|water|leak|burst)\b[^.!?]{0,60}?\bnear\s+(?:a\s+|an\s+|the\s+)?(?:power|electric|outlet|switchboard)/i,
   /structural\s+crack/i,
   /crack(ed)?\s+(wall|ceiling|foundation)/i,
-  /branch\s+(on|over)\s+(powerlines?|power\s+lines?)/i,
+  // Vegetation near powerlines/wires, intervening words allowed:
+  // "branch hanging over a roof near powerlines" (eval G3), "branch
+  // on the powerlines", "palm fronds touching overhead wires"
+  // (eval G7), "fronds near powerlines". A powerline/wire target is
+  // required, so "branch near the fence" does NOT fire.
+  /\b(?:branch|branches|frond|fronds|limb|limbs|tree)\b[^.!?]{0,60}?\b(?:powerlines?|power\s+lines?)\b/i,
+  /\b(?:branch|branches|frond|fronds)\b[^.!?]{0,40}?\b(?:overhead\s+)?wires?\b/i,
   /powerlines?\s+(down|hanging)/i,
 ];
 

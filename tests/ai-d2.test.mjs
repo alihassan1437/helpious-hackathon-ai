@@ -85,4 +85,50 @@ check('gateway and browser safety copies agree', () => {
   }
 });
 
-console.log(`\n${passed}/6 D2 tests passed`);
+// G7 recall (2026-11-01 widening): EVERY S-marked dayplan phrasing
+// must fire, in BOTH copies — the gates audit measured 3/6 before
+// the fix. Exact input strings from the eval dayplan Part 1.
+check('every dayplan S-case phrasing fires the safety card (both copies)', () => {
+  const sCases = [
+    'Burst flexi hose, laundry floor flooding near a power point', // P3
+    'I can smell gas near the cooktop', // P5
+    'Power point with scorch marks, it sparked', // E1
+    'Exposed wires hanging after storm damage', // E5
+    'Large branch hanging over a roof near powerlines', // G3
+    'Palm fronds touching overhead wires', // G7
+    // Natural variants the audit also measured as misses:
+    'branch on the powerlines',
+    'There is a gas leak smell in the kitchen',
+    'Water pooling under the sink near a power point',
+    'fronds near powerlines',
+    'flooding near power',
+  ];
+  for (const text of sCases) {
+    assert.equal(detectSafety(text), true, `browser copy missed: ${text}`);
+    assert.equal(gatewayDetectSafety(text), true, `gateway copy missed: ${text}`);
+  }
+});
+
+check('safety widening keeps sane negatives quiet (both copies)', () => {
+  const negatives = [
+    'I need a power point presentation for the office',
+    'Prepare a PowerPoint presentation for Monday',
+    'install a gas bayonet for a new heater', // P10 — a routine gas job, not a leak
+    'add two double power points in the kitchen', // E6
+    'safety switch keeps tripping when I use the kettle', // E2
+    'trim the hedge near the fence',
+    'water the garden beds and mow the lawn',
+    'burst pipe in the laundry',
+    'the tree near the fence needs a trim',
+    'Split system dripping water inside onto the wall', // A1
+    'Stormwater drain blocked, yard pooling after rain', // P9
+    'water pressure dropped across the whole house', // P7
+    'repaint after leak fixed', // PA6
+  ];
+  for (const text of negatives) {
+    assert.equal(detectSafety(text), false, `browser copy false-fired: ${text}`);
+    assert.equal(gatewayDetectSafety(text), false, `gateway copy false-fired: ${text}`);
+  }
+});
+
+console.log(`\n${passed}/8 D2 tests passed`);
