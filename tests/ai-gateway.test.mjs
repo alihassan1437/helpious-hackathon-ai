@@ -65,7 +65,7 @@ tests.push(() => check('stripPii removes dot-separated and mixed-separator mobil
     'ring +61.412.345.678',
     'ring +61 412 345 678',
     'my number is 0412345678',
-    'landline 08.8947.3255 after hours',
+    'landline 08.8912.0000 after hours',
   ]) {
     const { cleaned, removed } = stripPii(bait);
     assert.equal(removed, true, bait);
