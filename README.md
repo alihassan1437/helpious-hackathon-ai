@@ -31,6 +31,19 @@ D1 (27 October 2026): gateway skeleton with a mock provider and all
 feature flags OFF. No real model key is included in, or needed by,
 this repository — see the gateway docs in the workdir.
 
+Final status (2 November 2026): the gateway runs the real Meta
+Model API provider (Standard tier only), and the planned features —
+Snap-to-Quote, the fixed safety card, lead briefs, quote drafts
+from a business's own prices, paste-to-profile, and voice for
+customers and tradies — are built, unit-tested (six suites, 102
+tests) and proven live behind feature flags in the host app. The
+full 112-case evaluation was re-run against the fixed build on
+2 November 2026 and passed its gate (trade accuracy 94/100,
+safety-card recall 6/6, zero PII leaks, zero invented details);
+the one internal latency target it still misses is recorded
+honestly in EXTRACT.md. See EXTRACT.md for the full contents,
+the sync history, and what is deliberately not in this repo.
+
 ## Secrets
 
 This repository must never contain API keys, tokens, passwords,

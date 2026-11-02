@@ -11,7 +11,9 @@ sync, also 30 October 2026, added voice — "Describe it by voice"
 for customers and "Draft by voice" for tradies — including the
 verified transcription contract described below; the round 4 sync,
 1 November 2026, added the eval-driven gate fixes described in
-the round 4 note below). Paths are preserved from the host app.
+the round 4 note below; the final sync, 2 November 2026,
+  recorded the completed eval re-run results in that note and
+  changed no code). Paths are preserved from the host app.
 
 Contents:
 
@@ -247,10 +249,24 @@ Contents:
     could never have passed the route at all. Input is now
     measured with any image payload replaced by its SHA-256
     stand-in (the payload itself is still refused, per G1).
-  A full 112-case re-run against the fixed build is in progress;
-  its results will be recorded here when it completes. Until
-  then the honest status is: fixes built, unit-tested and
-  deployed; eval re-run pending.
+  The full 112-case re-run against the fixed build completed
+  on 2 November 2026 — live against the deployed gateway, the
+  same 112 cases scored by the same code; the feature flag was
+  enabled for the run and removed afterwards, with the end
+  state verified OFF. The gate PASSED: trade accuracy (strict)
+  94/100 (run 1: 26/100; semantic also 94/100), urgency
+  87/100, JSON validity 112/112, safety-card recall 6/6 (G3
+  and G7 now fire), PII leaks 0 across the corpus and across
+  four new live bait probes aimed at run 1's measured strip
+  gaps, invented details 0, and the per-user caps (F1)
+  confirmed live. One threshold still misses and is recorded
+  here, not massaged: latency median 6.43s against the
+  dayplan's own internal <4s target (p95 9.94s is inside its
+  15s bound) — an internal performance target, not a privacy
+  or safety gate. Estimated run cost ≈US$0.94 (run 1
+  ≈US$0.92; total eval spend under US$2 of the US$150
+  credit). The remaining strict-trade misses are real
+  specialty categories — defensible answers, scored as-is.
 - Tests (no network, no real key; provider tests use an injected
   stub fetch) — six suites, 102 tests:
   - `tests/ai-gateway.test.mjs` — 32 tests, `node tests/ai-gateway.test.mjs`
