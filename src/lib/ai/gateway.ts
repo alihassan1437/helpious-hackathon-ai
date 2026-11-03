@@ -703,13 +703,17 @@ export function isValidAiOutput(feature: AiFeature, output: unknown): boolean {
 // validated perfectly but arrived after the 15s budget, so both
 // attempts timed out and the feature fell back). It gets 60s. Voice
 // features chain TWO calls (transcribe, then the brief/quote chat),
-// so they get 45s.
+// so they get 45s. photo-brief gets 30s: the 2026-11-03 demo capture
+// caught two ~15s attempts timing out on a slow-reasoning call (the
+// retry with a longer combined window succeeded) — the brief is the
+// hero feature and its reasoning tail is longer than the default.
 // ---------------------------------------------------------------------------
 
 export const AI_TIMEOUT_MS = 15_000;
 
 export const FEATURE_TIMEOUT_MS: Partial<Record<AiFeature, number>> = {
   'paste-to-profile': 60_000,
+  'photo-brief': 30_000,
   'voice-brief': 45_000,
   'voice-quote': 45_000,
 };

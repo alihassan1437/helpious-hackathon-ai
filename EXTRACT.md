@@ -15,7 +15,10 @@ the round 4 note below; the 2 November 2026 sync recorded
 the completed eval re-run results in that note, and a round 5
 addendum, 3 November 2026, added the re-run method note and
 the test-fixture record in that note — neither sync changed
-any code). Paths are preserved from the host app.
+any code. A round 6 sync, later on 3 November 2026, raised
+the photo-brief timeout budget after the demo capture caught
+it falling back on a slow-reasoning call — see the timeout
+note. Paths are preserved from the host app.
 
 Contents:
 
@@ -27,7 +30,8 @@ Contents:
   caught it; see the round 4 note), per-job image cap, PII
   strip before cache and model, SHA-256 cache key including
   promptVersion, per-feature timeout budget (15s default;
-  paste-to-profile 60s, voice features 45s — see the timeout note
+  paste-to-profile 60s, voice features 45s, photo-brief 30s
+  — see the timeout note
   below), one repair retry, `{fallback: true}`. The input size
   cap is measured with any image payload replaced by its SHA-256
   stand-in rather than its base64 length (round 4, finding F2).
@@ -81,6 +85,13 @@ Contents:
   through the full production stack (real extraction, zero contact
   details leaked). Voice features chain two model calls
   (transcribe, then chat), so they get a 45s budget the same way.
+  Round 6 (3 November 2026): the demo-video capture caught the
+  photo-brief falling back live — two ~15s attempts timed out on
+  a slow-reasoning call while a repeat with a longer combined
+  window succeeded at ~31s, the same failure class as the
+  paste-to-profile fix. `photo-brief` now gets a 30s per-attempt
+  budget in `FEATURE_TIMEOUT_MS`; the capture re-run then
+  rendered the brief through the full production stack.
 - `src/lib/ai/business-ai.ts` — B1/B2 helpers shared by the Leads UI
   and the tests. Two honesty rules are enforced here: B1 input is
   the job's description text plus category and suburb ONLY (callers
